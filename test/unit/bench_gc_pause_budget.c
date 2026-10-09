@@ -31,34 +31,49 @@
  * walking it per lookup grows with the heap's fragmentation" (gc.c:3051).
  * The shipped gateway measured 12532 retained segments of 12533.
  *
- * WHAT THIS MEASURES. Two dimensions, because one alone proves nothing:
- * survivor count (how fragmented the retained heap is) and collection count
- * (whether cost accumulates across passes). Per point it records the pause and
- * the collector's own segment-walk counters, which are independent readings of
- * the same effect -- wall-clock pause is what a watchdog sees,
- * n00b_gc_last_segment_lookup_steps is what the collector actually did.
+ * WHAT THIS MEASURES. Three independent knobs, because any one alone misleads:
+ * survivor COUNT (how fragmented the retained heap is -- one retained run per
+ * survivor), payload BYTES per survivor (how much live data the collector must
+ * trace), and COLLECTION count (whether cost accumulates across passes). Per
+ * point it records the pause next to the collector's own segment-walk
+ * counters, so the wall-clock number has an independent check.
  *
- * Growth EXPONENTS are fitted between adjacent points rather than reporting raw
- * times, because the absolute numbers are machine-specific and the shape is
- * not. Linear (~1.0) in survivors is the cost of having more live data to
- * trace and is expected.
+ * MEASURED (macOS arm64, 2026-10-09). The pause is superlinear in SCANNED
+ * BYTES, and essentially independent of everything else.
  *
- * WHAT IT REPRODUCES, AND WHAT IT DOES NOT (measured, macOS arm64, 2026-10-09).
- * The segment shape reproduces exactly: segments^1.00 with survivors, one
- * retained run per survivor -- 16002 segments of which 16001 retained, the same
- * ratio the shipping gateway showed at 12533/12532. Per-lookup cost does grow
- * with it (steps/lookup 10.2 -> 13.8 as segments go 2k -> 16k), and the pause
- * exponent crosses 1.0 (1.00 then 1.22) as the heap grows.
+ * Holding survivors at 2000 -- so segments stay at 2002 and lookup_steps at
+ * ~40400, CONSTANT -- and scaling payload:
  *
- * It does NOT yet reproduce the unbounded pause. At 16000 survivors a
- * collection takes ~178 ms -- inside the 250 ms budget, not 189 s. Two things
- * this rules out: cost does not accumulate across collections at a fixed live
- * set (the last pass is consistently FASTER than the first, 0.59-0.86x), and
- * the segment lookup is tree-structured rather than a linear walk, so segment
- * count alone buys only a log factor. The gateway carried a 429 MB live set
- * against this harness's few MB, so live-set SIZE is the remaining untested
- * variable and the next thing to sweep. Recorded here rather than in a comment
- * on the issue so the next person does not re-derive it.
+ *     live MB     33     46    156    281    531
+ *     pause ms    42    128    841   1546   4600
+ *
+ * log-log slope 1.60 overall. At 531 MB (past the gateway's 429 MB live set) a
+ * single collection takes 4.6 s: 18x the documented budget, and the shape says
+ * the gateway's 189 s is the same curve further along.
+ *
+ * The control arm settles what "scanned" is doing. With N00B_BENCH_NOSCAN=1 --
+ * identical bytes, identical segments, collector simply not scanning the
+ * payload:
+ *
+ *     live MB        46    156    531
+ *     scanned ms    128    841   4600
+ *     noscan ms      26     24     24      <- FLAT
+ *                   5.0x  34.7x  189.2x
+ *
+ * So the cost is not mapping, moving or reclaiming pages, all of which the
+ * control still pays. It is in the SCAN, and it grows faster than the bytes
+ * scanned.
+ *
+ * WHAT IS RULED OUT. Cost does not accumulate across collections at a fixed
+ * live set -- the last of N passes runs 0.56-0.94x the first, consistently
+ * FASTER. And segment count alone buys only a log factor: n00b_from_segment_for
+ * consults an interval tree (gc.c:3055), so 16k segments cost ~13 steps per
+ * lookup rather than 16k. Both were plausible readings of gc.c:3051 and both
+ * are wrong; the bytes are what matter.
+ *
+ * Fragmentation is still what makes pin-all expensive -- it is why the gateway
+ * holds a 429 MB live set in 12532 retained runs -- but the pause is paid per
+ * scanned byte, not per segment.
  *
  * REGISTERED AS A TEST at a small size, where it asserts the documented 0.25 s
  * budget directly. That assertion is the thing this file exists to add: today
@@ -68,8 +83,9 @@
  * linked -- without it a type-map build silently measures the copying
  * collector instead, and reports a pass that means nothing.
  *
- * N00B_BENCH_SURVIVORS (comma-separated counts), N00B_BENCH_COLLECTIONS and
- * N00B_BENCH_PAUSE_BUDGET_MS size it.
+ * N00B_BENCH_SURVIVORS (comma-separated counts), N00B_BENCH_PAYLOAD_BYTES,
+ * N00B_BENCH_NOSCAN, N00B_BENCH_COLLECTIONS and N00B_BENCH_PAUSE_BUDGET_MS
+ * size it.
  */
 
 #include <math.h>
@@ -108,6 +124,18 @@ extern _Atomic uint64_t n00b_gc_last_segment_lookup_steps;
         .allocator = (n00b_allocator_t *)(a)                                   \
     }
 
+// Control arm: same bytes, same segments, but the collector does not scan the
+// payload. N00B_BENCH_NOSCAN=1 selects it. If the pause tracks bytes just as
+// steeply with scanning OFF, the cost is in moving/mapping pages rather than
+// in tracing, and the "superlinear in traced bytes" reading would be wrong.
+#define ARENA_OPTS_NOSCAN(a)                                                   \
+    &(n00b_alloc_opts_t)                                                       \
+    {                                                                          \
+        .allocator = (n00b_allocator_t *)(a), .no_scan = true                  \
+    }
+
+static bool payload_noscan = false;
+
 // A survivor with a pointer field, so the object is scanned rather than
 // treated as a leaf. Each one is reached from the roots array below and so
 // survives every collection.
@@ -115,6 +143,8 @@ typedef struct survivor_t {
     uint64_t           magic;
     uint64_t           index;
     struct survivor_t *link;
+    void             **body;       // live payload, traced through this pointer
+    uint64_t           body_slots;
 } survivor_t;
 
 #define SURVIVOR_MAGIC UINT64_C(0x5339C0115E7A1100)
@@ -150,6 +180,8 @@ now_ns(void)
 
 typedef struct {
     uint64_t survivors;
+    uint64_t payload;        // live bytes per survivor
+    uint64_t live_mb;        // arena bytes in use when the pass ran
     uint64_t collections;    // how many collections preceded the measured one
     double   first_ms;       // the first collection, for reference
     double   collect_ms;     // wall clock around the MEASURED collection
@@ -189,13 +221,18 @@ segment_stats(n00b_arena_t *arena, uint64_t *total, uint64_t *retained)
     *retained = r;
 }
 
-// Allocate `n` survivors and keep every one reachable. Interleaving garbage
-// between them is what makes the survivors land in separate page runs: under
-// pin-all each surviving run is retained in place and contributes its own
-// segment, which is the growth being measured. A dense block of survivors
-// would pin a handful of runs regardless of count and show nothing.
+// Allocate `n` survivors, each carrying `payload` bytes of live data, and keep
+// every one reachable.
+//
+// TWO INDEPENDENT KNOBS, which is the point. `n` sets how FRAGMENTED the
+// retained heap is (one retained run per survivor); `payload` sets how many
+// live BYTES the collector must trace. Sweeping n alone conflates them --
+// that is how the first version of this bench concluded the pause was bounded
+// when it had only ever measured a few MB. Holding n fixed and scaling payload
+// isolates cost-per-byte, which is the term that was never tested against the
+// shipping gateway's 429 MB live set.
 static void
-build_heap(n00b_arena_t *arena, uint64_t n)
+build_heap(n00b_arena_t *arena, uint64_t n, uint64_t payload)
 {
     g_roots  = n00b_alloc_array(survivor_t *, n);
     CHECK(g_roots != nullptr);
@@ -208,6 +245,34 @@ build_heap(n00b_arena_t *arena, uint64_t n)
         s->index   = i;
         s->link    = nullptr;
         g_roots[i] = s;
+
+        // Live bytes hanging off the survivor. Reached only through s->body,
+        // so it is traced via the survivor rather than rooted separately, and
+        // it is a pointer array rather than a byte blob so the collector has
+        // to SCAN it -- a no_scan blob would grow the heap without growing the
+        // trace, which would measure the wrong thing.
+        if (payload > 0) {
+            uint64_t slots = payload / sizeof(void *);
+            if (slots == 0) {
+                slots = 1;
+            }
+            void **body = payload_noscan
+                            ? n00b_alloc_array_with_opts(void *,
+                                                         slots,
+                                                         ARENA_OPTS_NOSCAN(arena))
+                            : n00b_alloc_array_with_opts(void *,
+                                                         slots,
+                                                         ARENA_OPTS(arena));
+            CHECK(body != nullptr);
+            // Self-references: real pointers for the scanner to follow that
+            // introduce no new objects, so live bytes scale with `payload`
+            // and object COUNT stays pinned to `n`.
+            for (uint64_t k = 0; k < slots; k += 8) {
+                body[k] = (void *)s;
+            }
+            s->body       = body;
+            s->body_slots = slots;
+        }
 
         // Garbage between survivors, sized to push the NEXT survivor onto a
         // different page. This is load-bearing, not padding: pin-all retains
@@ -237,6 +302,11 @@ verify_heap(void)
         CHECK(g_roots[i] != nullptr);
         CHECK(g_roots[i]->magic == SURVIVOR_MAGIC);
         CHECK(g_roots[i]->index == i);
+        // The payload must have come through too, or the pause is describing
+        // a collection that dropped live data rather than traced it.
+        if (g_roots[i]->body != nullptr && !payload_noscan) {
+            CHECK(g_roots[i]->body[0] == (void *)g_roots[i]);
+        }
     }
 }
 
@@ -250,13 +320,19 @@ verify_heap(void)
 // collections, the last pause exceeds the first at fixed live-set size, and
 // the segment counts below say so directly.
 static point_t
-run_point(uint64_t survivors, uint64_t collections)
+run_point(uint64_t survivors, uint64_t payload, uint64_t collections)
 {
-    point_t       p     = {.survivors = survivors, .collections = collections};
-    n00b_arena_t *arena = n00b_new_arena(.size = 1 << 26, .use_gc = true);
+    point_t p = {.survivors   = survivors,
+                 .payload     = payload,
+                 .collections = collections};
+
+    // Size the arena to the live set with headroom, so a large payload is not
+    // measuring repeated arena growth instead of collection cost.
+    uint64_t want  = (survivors * (payload + 256)) * 4 + (1 << 26);
+    n00b_arena_t *arena = n00b_new_arena(.size = want, .use_gc = true);
     CHECK(arena != nullptr);
 
-    build_heap(arena, survivors);
+    build_heap(arena, survivors, payload);
 
     for (uint64_t i = 0; i < collections; i++) {
         uint64_t start = now_ns();
@@ -289,6 +365,7 @@ run_point(uint64_t survivors, uint64_t collections)
     p.steps_per_lookup = p.lookups ? (double)p.lookup_steps / (double)p.lookups
                                    : 0.0;
     segment_stats(arena, &p.segments, &p.retained);
+    p.live_mb = n00b_arena_used(arena) / (1024 * 1024);
 
     g_roots  = nullptr;
     g_nroots = 0;
@@ -348,14 +425,21 @@ main(int argc, char **argv)
     }
 
     uint64_t collections = env_u64("N00B_BENCH_COLLECTIONS", 20);
+    // Live bytes per survivor. 0 keeps the original object-count-only shape.
+    uint64_t payload     = env_u64("N00B_BENCH_PAYLOAD_BYTES", 0);
+    payload_noscan       = env_u64("N00B_BENCH_NOSCAN", 0) != 0;
 
     printf("n00b#539: stop-the-world pause vs survivors and collection count"
            " (pin-all)\n");
-    printf("budget: %llu ms (runtime.h:138);  %llu collections per point\n\n",
+    printf("budget: %llu ms (runtime.h:138);  %llu collections per point;"
+           "  payload %llu B/survivor%s\n\n",
            (unsigned long long)pause_budget_ms,
-           (unsigned long long)collections);
-    printf("  %10s  %9s  %9s  %12s  %9s  %8s  %8s\n",
+           (unsigned long long)collections,
+           (unsigned long long)payload,
+           payload_noscan ? " (NOT scanned -- control arm)" : "");
+    printf("  %10s  %8s  %9s  %9s  %12s  %9s  %8s  %8s\n",
            "survivors",
+           "live MB",
            "first ms",
            "last ms",
            "lookup steps",
@@ -365,9 +449,10 @@ main(int argc, char **argv)
 
     point_t points[MAX_POINTS];
     for (uint64_t i = 0; i < nsizes; i++) {
-        points[i] = run_point(sizes[i], collections);
-        printf("  %10llu  %9.2f  %9.2f  %12llu  %9.2f  %8llu  %8llu\n",
+        points[i] = run_point(sizes[i], payload, collections);
+        printf("  %10llu  %8llu  %9.2f  %9.2f  %12llu  %9.2f  %8llu  %8llu\n",
                (unsigned long long)points[i].survivors,
+               (unsigned long long)points[i].live_mb,
                points[i].first_ms,
                points[i].collect_ms,
                (unsigned long long)points[i].lookup_steps,
