@@ -68,9 +68,10 @@ main(int argc, char **argv)
            (unsigned long long)lookups,
            (unsigned long long)steps);
 
-    REQUIRE(lookups >= LIVE_N);
     // A balanced search over ~LIVE_N segments is about 9 levels deep; a chain
-    // walk averages LIVE_N / 2 per lookup.
+    // walk averages LIVE_N / 2 per lookup. Reached objects reuse the segment the
+    // scan already found, so the lookups left are few, not one per object.
+    REQUIRE(lookups > 0);
     REQUIRE(steps <= 16 * lookups);
 
     for (int i = 0; i < LIVE_N; i++) {

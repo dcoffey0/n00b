@@ -84,8 +84,10 @@
  * collector instead, and reports a pass that means nothing.
  *
  * N00B_BENCH_SURVIVORS (comma-separated counts), N00B_BENCH_PAYLOAD_BYTES,
- * N00B_BENCH_NOSCAN, N00B_BENCH_COLLECTIONS and N00B_BENCH_PAUSE_BUDGET_MS
- * size it.
+ * N00B_BENCH_NOSCAN, N00B_BENCH_INTERIOR, N00B_BENCH_COLLECTIONS and
+ * N00B_BENCH_PAUSE_BUDGET_MS size it. "guard words" is n00b_sentinel_scan_words
+ * over the measured collection: the words the backward guard scan walked to
+ * resolve interior pointers.
  */
 
 #include <math.h>
@@ -135,6 +137,9 @@ extern _Atomic uint64_t n00b_gc_last_segment_lookup_steps;
     }
 
 static bool payload_noscan = false;
+// N00B_BENCH_INTERIOR=1: payload slots point into the payload itself rather
+// than at the survivor, so each one resolves through the backward guard scan.
+static bool payload_interior = false;
 
 // A survivor with a pointer field, so the object is scanned rather than
 // treated as a leaf. Each one is reached from the roots array below and so
@@ -190,6 +195,7 @@ typedef struct {
     double   steps_per_lookup;
     uint64_t segments;       // arena segment chain length after the run
     uint64_t retained;       // of which retained (pin-all survivor runs)
+    uint64_t guard_words;    // backward guard-scan words, measured collection
 } point_t;
 
 // Walk the arena's segment chain. This is the quantity the whole issue turns
@@ -268,7 +274,8 @@ build_heap(n00b_arena_t *arena, uint64_t n, uint64_t payload)
             // introduce no new objects, so live bytes scale with `payload`
             // and object COUNT stays pinned to `n`.
             for (uint64_t k = 0; k < slots; k += 8) {
-                body[k] = (void *)s;
+                body[k] = payload_interior && k > 0 ? (void *)&body[k]
+                                                    : (void *)s;
             }
             s->body       = body;
             s->body_slots = slots;
@@ -335,7 +342,8 @@ run_point(uint64_t survivors, uint64_t payload, uint64_t collections)
     build_heap(arena, survivors, payload);
 
     for (uint64_t i = 0; i < collections; i++) {
-        uint64_t start = now_ns();
+        uint64_t guard_words = n00b_atomic_load(&n00b_sentinel_scan_words);
+        uint64_t start       = now_ns();
         n00b_stop_the_world();
         n00b_collect(arena);
         n00b_restart_the_world();
@@ -344,7 +352,8 @@ run_point(uint64_t survivors, uint64_t payload, uint64_t collections)
         if (i == 0) {
             p.first_ms = ms;
         }
-        p.collect_ms = ms;
+        p.collect_ms  = ms;
+        p.guard_words = n00b_atomic_load(&n00b_sentinel_scan_words) - guard_words;
 
         // Churn between collections: fresh garbage, so each pass has
         // something to reclaim and the survivors get re-pinned rather than
@@ -428,6 +437,7 @@ main(int argc, char **argv)
     // Live bytes per survivor. 0 keeps the original object-count-only shape.
     uint64_t payload     = env_u64("N00B_BENCH_PAYLOAD_BYTES", 0);
     payload_noscan       = env_u64("N00B_BENCH_NOSCAN", 0) != 0;
+    payload_interior     = env_u64("N00B_BENCH_INTERIOR", 0) != 0;
 
     printf("n00b#539: stop-the-world pause vs survivors and collection count"
            " (pin-all)\n");
@@ -437,7 +447,7 @@ main(int argc, char **argv)
            (unsigned long long)collections,
            (unsigned long long)payload,
            payload_noscan ? " (NOT scanned -- control arm)" : "");
-    printf("  %10s  %8s  %9s  %9s  %12s  %9s  %8s  %8s\n",
+    printf("  %10s  %8s  %9s  %9s  %12s  %9s  %8s  %8s  %12s\n",
            "survivors",
            "live MB",
            "first ms",
@@ -445,12 +455,14 @@ main(int argc, char **argv)
            "lookup steps",
            "steps/lk",
            "segments",
-           "retained");
+           "retained",
+           "guard words");
 
     point_t points[MAX_POINTS];
     for (uint64_t i = 0; i < nsizes; i++) {
         points[i] = run_point(sizes[i], payload, collections);
-        printf("  %10llu  %8llu  %9.2f  %9.2f  %12llu  %9.2f  %8llu  %8llu\n",
+        printf("  %10llu  %8llu  %9.2f  %9.2f  %12llu  %9.2f  %8llu  %8llu"
+               "  %12llu\n",
                (unsigned long long)points[i].survivors,
                (unsigned long long)points[i].live_mb,
                points[i].first_ms,
@@ -458,7 +470,8 @@ main(int argc, char **argv)
                (unsigned long long)points[i].lookup_steps,
                points[i].steps_per_lookup,
                (unsigned long long)points[i].segments,
-               (unsigned long long)points[i].retained);
+               (unsigned long long)points[i].retained,
+               (unsigned long long)points[i].guard_words);
     }
 
     // Does the pause grow with COLLECTION COUNT at a fixed live set? That is

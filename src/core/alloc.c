@@ -1483,7 +1483,7 @@ n00b_allocator_destroy(n00b_allocator_t *allocator)
     allocator_destroy_now(allocator);
 }
 
-#define find_sentinal(p, m) _find_sentinal(((uint64_t)p), (m))
+#define find_sentinal(p, m, memo) _find_sentinal(((uint64_t)p), (m), (memo))
 
 // Backstop for the conservative scan: a candidate that resolves into a managed
 // segment but is NOT a real object pointer (a non-pointer int slot, or a stack/
@@ -1550,8 +1550,102 @@ sentinal_scan_account(uint64_t *from, uint64_t *to)
                               memory_order_relaxed);
 }
 
+// The guard memo records, for each N00B_GUARD_MEMO_LINE-aligned address B a
+// backward walk has crossed, the nearest guard word below B. A walk that found
+// none before stopping at its mapping's start S records S | 1 instead, which
+// answers only walks whose own floor is at or above S: a walk resolved against
+// an enclosing mapping must keep looking below S. A later walk stops at the
+// first line boundary that answers it, so each line of the heap is walked once
+// per memo. Lines are kept in one array per page, found through the memo's
+// dict.
+#define N00B_GUARD_MEMO_LINE 256
+
+static uint64_t *
+guard_memo_lines(n00b_guard_memo_t *memo, uintptr_t page)
+{
+    if (memo->last_lines != nullptr && memo->last_page == page) {
+        return memo->last_lines;
+    }
+
+    bool  found = false;
+    void *lines = n00b_dict_untyped_get(&memo->pages, (void *)page, &found);
+
+    if (!found) {
+        lines = n00b_alloc_array_with_opts(
+            uint64_t,
+            n00b_page_size / N00B_GUARD_MEMO_LINE,
+            &(n00b_alloc_opts_t){.allocator = memo->allocator});
+        n00b_dict_untyped_put(&memo->pages, (void *)page, lines);
+    }
+    memo->last_page  = page;
+    memo->last_lines = lines;
+    return lines;
+}
+
+static char *
+find_sentinal_memo(uint64_t          *p0,
+                   uint64_t          *floor,
+                   uint64_t          *start,
+                   n00b_guard_memo_t *memo)
+{
+    uintptr_t pgmask    = (uintptr_t)n00b_page_size - 1;
+    uintptr_t linemask  = N00B_GUARD_MEMO_LINE - 1;
+    uintptr_t cur_page  = ~(uintptr_t)0;
+    uint64_t *cur_lines = nullptr;
+    uint64_t *p         = p0;
+    uint64_t  answer    = 0;
+
+    while (p >= floor) {
+        if (*p == n00b_gc_guard) {
+            answer = (uint64_t)p;
+            break;
+        }
+        if (((uintptr_t)p & linemask) == 0 && p > start) {
+            uintptr_t page = (uintptr_t)p & ~pgmask;
+            if (page != cur_page) {
+                cur_page  = page;
+                cur_lines = guard_memo_lines(memo, page);
+            }
+            uint64_t known = cur_lines[((uintptr_t)p & pgmask) / N00B_GUARD_MEMO_LINE];
+            if (known != 0 && (!(known & 1) || (uint64_t *)(known & ~1ULL) <= floor)) {
+                answer = known;
+                break;
+            }
+        }
+        p--;
+    }
+
+    // Reaching the mapping's start without a guard is an answer; stopping at
+    // the per-mapping cap is not, since a guard may lie further down.
+    if (answer == 0 && floor == start) {
+        answer = (uint64_t)start | 1;
+    }
+
+    sentinal_scan_account(p0, p);
+
+    if (answer == 0) {
+        return nullptr;
+    }
+
+    for (uintptr_t b = (uintptr_t)p0 & ~linemask;
+         b > (uintptr_t)p && b > (uintptr_t)start;
+         b -= N00B_GUARD_MEMO_LINE) {
+        uintptr_t page = b & ~pgmask;
+        if (page != cur_page) {
+            cur_page  = page;
+            cur_lines = guard_memo_lines(memo, page);
+        }
+        cur_lines[(b & pgmask) / N00B_GUARD_MEMO_LINE] = answer;
+    }
+
+    if ((answer & 1) || (uint64_t *)answer < floor) {
+        return nullptr;
+    }
+    return (char *)answer;
+}
+
 static inline char *
-_find_sentinal(uint64_t p_num, n00b_mmap_info_t *map)
+_find_sentinal(uint64_t p_num, n00b_mmap_info_t *map, n00b_guard_memo_t *memo)
 {
     uint64_t *start = (uint64_t *)map->start;
     uint64_t *p     = (uint64_t *)n00b_align_floor(p_num, sizeof(void *));
@@ -1619,6 +1713,10 @@ _find_sentinal(uint64_t p_num, n00b_mmap_info_t *map)
 
     bool page_checks_needed = (map->perms == n00b_mmap_perms_unknown);
 
+    if (memo != nullptr && !page_checks_needed) {
+        return find_sentinal_memo(p0, floor, start, memo);
+    }
+
     uintptr_t pgmask   = (uintptr_t)n00b_page_size - 1;
     uintptr_t cur_page = ~(uintptr_t)0;
     while (p >= floor) {
@@ -1652,22 +1750,25 @@ _find_sentinal(uint64_t p_num, n00b_mmap_info_t *map)
 // Returns nullptr if not found. This obviously should all change to
 // return a variant, once I revisit variants.
 
-[[n00b::nogc]] void
-_n00b_find_alloc_info(void *addr, n00b_alloc_info_t *result) _kargs
+[[n00b::nogc]] static void
+find_alloc_info(void                *addr,
+                n00b_alloc_info_t   *result,
+                bool                 scan_for_header,
+                n00b_guard_memo_t   *guard_memo,
+                n00b_mmap_info_t    *mmap)
 {
-    n00b_allocator_t *allocator       = nullptr;
-    bool              scan_for_header = false;
-}
-{
-    auto  mmap_opt = n00b_mmap_by_address(addr);
-    char *p        = (char *)addr;
+    char *p = (char *)addr;
 
-    if (!n00b_option_is_set(mmap_opt)) {
-        *result = (n00b_alloc_info_t){.kind = n00b_alloc_none};
-        return;
+    if (mmap == nullptr || (uint64_t)addr < mmap->start || (uint64_t)addr >= mmap->end) {
+        auto mmap_opt = n00b_mmap_by_address(addr);
+
+        if (!n00b_option_is_set(mmap_opt)) {
+            *result = (n00b_alloc_info_t){.kind = n00b_alloc_none};
+            return;
+        }
+        mmap = n00b_option_get(mmap_opt);
     }
 
-    n00b_mmap_info_t *mmap = n00b_option_get(mmap_opt);
     n00b_allocator_t *al   = mmap->allocator;
     switch (mmap->kind) {
     case n00b_mmap_static: {
@@ -1690,7 +1791,7 @@ _n00b_find_alloc_info(void *addr, n00b_alloc_info_t *result) _kargs
         }
 
         if (scan_for_header && al->add_inline_header) {
-            char *scan_ptr = find_sentinal(p, mmap);
+            char *scan_ptr = find_sentinal(p, mmap, guard_memo);
 
             if (!scan_ptr) {
                 break;
@@ -1767,6 +1868,28 @@ _n00b_find_alloc_info(void *addr, n00b_alloc_info_t *result) _kargs
     }
     *result = (n00b_alloc_info_t){.kind = n00b_alloc_none};
     return;
+}
+
+[[n00b::nogc]] void
+_n00b_find_alloc_info(void *addr, n00b_alloc_info_t *result) _kargs
+{
+    n00b_allocator_t *allocator       = nullptr;
+    bool              scan_for_header = false;
+}
+{
+    find_alloc_info(addr, result, scan_for_header, nullptr, nullptr);
+}
+
+[[n00b::nogc]] n00b_alloc_info_t
+n00b_find_alloc_info_in(void              *addr,
+                        n00b_mmap_info_t  *mmap,
+                        bool               scan_for_header,
+                        n00b_guard_memo_t *guard_memo)
+{
+    n00b_alloc_info_t result;
+
+    find_alloc_info(addr, &result, scan_for_header, guard_memo, mmap);
+    return result;
 }
 
 // Fast-path allocation resolution when the owning allocator is already known
