@@ -312,6 +312,35 @@ typedef struct {
 } n00b_gc_wl_item_t;
 
 /**
+ * @brief Per-collection memo of the conservative backward guard scan.
+ *
+ * Maps each 256-byte line a backward guard scan has crossed to the nearest
+ * guard below it, so a later scan stops at the first such line it reaches and
+ * each line is scanned once per memo. Valid only while no guard word in the
+ * memoized mappings is written or erased, which holds for registered arena
+ * segments and pool pages while the world is stopped.
+ */
+typedef struct {
+    n00b_dict_untyped_t pages;     // page base -> uint64_t[page / 256] lines
+    n00b_allocator_t   *allocator; // line arrays; freed with it
+    uintptr_t           last_page; // most recent `pages` lookup
+    uint64_t           *last_lines;
+} n00b_guard_memo_t;
+
+/**
+ * @brief n00b_find_alloc_info for an address the caller already knows the
+ * registry record of.
+ *
+ * `mmap` stands in for the global registry search when it covers `addr`, and
+ * is ignored otherwise. A non-null `memo` memoizes the backward guard scan
+ * that `scan_for_header` runs.
+ */
+extern n00b_alloc_info_t n00b_find_alloc_info_in(void              *addr,
+                                                 n00b_mmap_info_t  *mmap,
+                                                 bool               scan_for_header,
+                                                 n00b_guard_memo_t *memo);
+
+/**
  * @brief Per-collection state, stack-allocated by the collector entry point.
  */
 typedef struct {
@@ -365,6 +394,9 @@ typedef struct {
      * n00b_gc_last_segment_lookups / n00b_gc_last_segment_lookup_steps. */
     uint64_t                          segment_lookups;
     uint64_t                          segment_lookup_steps;
+    /* Interior-pointer resolutions outside the to-space share this memo, so
+     * the mark scans each heap line once per collection. */
+    n00b_guard_memo_t                 guard_memo;
 } n00b_collect_t;
 
 // ============================================================================
