@@ -229,6 +229,12 @@ typedef struct n00b_marshal_node_t {
     void                         *scan_user;
     uint64_t                     *bitmap;
     uint64_t                      bitmap_words;
+    // End (exclusive) of the words the line index resolves to this node. The
+    // backward guard scan would stop at a guard-valued payload word, so the
+    // index stops there too; null when the node is not indexed. A node is
+    // indexed when the first interior pointer into it resolves.
+    char                         *index_end;
+    bool                          index_tried;
 } n00b_marshal_node_t;
 
 typedef struct {
@@ -281,6 +287,14 @@ struct n00b_marshal_ctx_t {
     n00b_marshal_status_t   status;
     n00b_string_t          *error;
     bool                    used;
+    // Line index of the graph's nodes: page base -> node pointer per
+    // MARSHAL_NODE_LINE bytes. A word inside an indexed node resolves to it
+    // without a guard scan or a registry search. It depends only on the
+    // graph's own objects, which the marshal already requires to hold still.
+    n00b_dict_untyped_t     node_lines;
+    bool                    node_lines_ready;
+    uintptr_t               node_lines_page;
+    n00b_marshal_node_t   **node_lines_last;
 };
 
 struct n00b_unmarshal_ctx_t {
@@ -1090,6 +1104,115 @@ alloc_view(n00b_alloc_info_t              info,
     return false;
 }
 
+#define MARSHAL_NODE_LINE 256
+
+// The line array of `page` in the node index, created when `create` is set.
+static n00b_marshal_node_t **
+marshal_node_lines(n00b_marshal_ctx_t *ctx, uintptr_t page, bool create)
+{
+    if (ctx->node_lines_last != nullptr && ctx->node_lines_page == page) {
+        return ctx->node_lines_last;
+    }
+    if (!ctx->node_lines_ready) {
+        if (!create) {
+            return nullptr;
+        }
+        // clang-format off
+        n00b_dict_untyped_init(&ctx->node_lines,
+                               .allocator     = ctx->scratch_alloc,
+                               .hash          = n00b_hash_word,
+                               .skip_obj_hash = true,
+                               .scan_kind     = N00B_GC_SCAN_KIND_NONE);
+        // clang-format on
+        ctx->node_lines_ready = true;
+    }
+
+    bool                  found = false;
+    n00b_marshal_node_t **lines = n00b_dict_untyped_get(&ctx->node_lines, (void *)page, &found);
+
+    if (!found) {
+        if (!create) {
+            return nullptr;
+        }
+        size_t bytes = (n00b_page_size / MARSHAL_NODE_LINE) * sizeof(*lines);
+        lines        = marshal_scratch_alloc(ctx->scratch_alloc, bytes);
+        memset(lines, 0, bytes);
+        n00b_dict_untyped_put(&ctx->node_lines, (void *)page, lines);
+    }
+    ctx->node_lines_page = page;
+    ctx->node_lines_last = lines;
+    return lines;
+}
+
+// Index the words of an inline-header node that resolve to it: from its user
+// pointer to the end of the allocation. A guard-valued word after the node's
+// own guard ends the range a header's length past it, because a backward guard
+// scan starts a header below the pointer and would stop at that word. A line
+// keeps the first node indexed into it; lookups check the node's bounds.
+static void
+marshal_index_node(n00b_marshal_ctx_t *ctx, n00b_marshal_node_t *node)
+{
+    node->index_tried = true;
+    if (!(node->rec.flags & N00B_MARSHAL_ALLOC_F_SOURCE_INLINE)) {
+        return;
+    }
+
+    char     *user = node->user_ptr;
+    char     *end  = user + node->rec.user_len;
+    uint64_t *w    = (uint64_t *)(user - N00B_ALLOC_HDR_SZ) + 1;
+
+    for (; (char *)w < end; w++) {
+        if (*w == n00b_gc_guard) {
+            if ((char *)w + N00B_ALLOC_HDR_SZ < end) {
+                end = (char *)w + N00B_ALLOC_HDR_SZ;
+            }
+            break;
+        }
+    }
+    if (end <= user) {
+        return;
+    }
+    node->index_end = end;
+
+    uintptr_t pgmask = (uintptr_t)n00b_page_size - 1;
+    uintptr_t line   = (uintptr_t)user & ~(uintptr_t)(MARSHAL_NODE_LINE - 1);
+
+    for (; line < (uintptr_t)end; line += MARSHAL_NODE_LINE) {
+        n00b_marshal_node_t **lines = marshal_node_lines(ctx, line & ~pgmask, true);
+        n00b_marshal_node_t **slot  = &lines[(line & pgmask) / MARSHAL_NODE_LINE];
+        if (*slot == nullptr) {
+            *slot = node;
+        }
+    }
+}
+
+// The graph node `word` points into, if the marshal already holds it: an exact
+// user pointer, or a word the line index resolves.
+static n00b_marshal_node_t *
+marshal_node_for(n00b_marshal_ctx_t *ctx, uint64_t word)
+{
+    bool                 found = false;
+    void                *key   = (void *)(uintptr_t)word;
+    n00b_marshal_node_t *node  = n00b_dict_get(ctx->memos, key, &found);
+
+    if (found) {
+        return node;
+    }
+
+    uintptr_t             pgmask = (uintptr_t)n00b_page_size - 1;
+    n00b_marshal_node_t **lines  = marshal_node_lines(ctx, word & ~pgmask, false);
+
+    if (lines == nullptr) {
+        return nullptr;
+    }
+    node = lines[(word & pgmask) / MARSHAL_NODE_LINE];
+    if (node != nullptr && word >= (uint64_t)(uintptr_t)node->user_ptr
+        && word < (uint64_t)(uintptr_t)node->index_end) {
+        return node;
+    }
+    return nullptr;
+}
+
 static n00b_marshal_node_t *
 marshal_add_alloc(n00b_marshal_ctx_t *ctx, n00b_alloc_info_t info)
 {
@@ -1194,6 +1317,8 @@ marshal_add_alloc(n00b_marshal_ctx_t *ctx, n00b_alloc_info_t info)
     node->scan_user   = scan_user;
     node->bitmap      = nullptr;
     node->bitmap_words = 0;
+    node->index_end    = nullptr;
+    node->index_tried  = false;
 
     node->rec.vaddr       = node->vaddr;
     node->rec.user_len    = user_len;
@@ -1786,6 +1911,9 @@ marshal_resolve_and_rewrite(n00b_marshal_ctx_t *ctx,
         return false;
     }
     words[i] = target->vaddr + interior;
+    if (interior != 0 && !target->index_tried) {
+        marshal_index_node(ctx, target);
+    }
     return true;
 }
 
@@ -1845,6 +1973,17 @@ scan_node(n00b_marshal_ctx_t *ctx, n00b_marshal_node_t *node)
                     words[i] = 0;
                 }
                 rewritten = true;
+            }
+
+            // A word inside a node the marshal already holds resolves to it
+            // directly; only the first base and first interior pointer into
+            // each object pay for the registry search and guard scan below.
+            if (!rewritten) {
+                n00b_marshal_node_t *known = marshal_node_for(ctx, word);
+                if (known != nullptr) {
+                    words[i]  = known->vaddr + (word - (uint64_t)(uintptr_t)known->user_ptr);
+                    rewritten = true;
+                }
             }
 
             // Fast path (GC-style "already managed"): try the allocator the

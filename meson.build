@@ -2863,6 +2863,14 @@ marshal_scratch_bound_test = executable('test_marshal_scratch_bound',
 )
 test('marshal_scratch_bound', marshal_scratch_bound_test, suite: 'unit')
 
+# n00b#539: the marshal's interior-pointer resolution must stay linear in
+# graph size, in both marshal modes and every heap a graph lives in.
+marshal_interior_scan_linear_test = executable('test_marshal_interior_scan_linear',
+    ['test/unit/test_marshal_interior_scan_linear.c'],
+    kwargs: test_common_kwargs,
+)
+test('marshal_interior_scan_linear', marshal_interior_scan_linear_test, suite: 'unit')
+
 # Released big-page cache in pool.c: exact-size reuse is zeroed, a full class
 # and the cap refuse, a .page_cache = false pool never parks, a parked page
 # ages out across two collections, and N00B_POOL_PAGE_CACHE_MB=0 disables it.
@@ -4162,6 +4170,36 @@ gc_scan_bound_test = executable('test_gc_scan_bound',
 )
 test('gc_scan_bound', gc_scan_bound_test, suite: 'unit')
 
+# n00b#539: the mark's interior-pointer resolution must stay linear in object
+# size. Bounds guard-scan words per added heap word, under both collectors.
+gc_interior_scan_linear_test = executable('test_gc_interior_scan_linear',
+    ['test/unit/test_gc_interior_scan_linear.c'],
+    kwargs: test_common_kwargs,
+)
+test('gc_interior_scan_linear_pin_all',
+    gc_interior_scan_linear_test,
+    suite: 'unit',
+    env: {'N00B_GC_PIN_ALL': '1'})
+test('gc_interior_scan_linear_copying',
+    gc_interior_scan_linear_test,
+    suite: 'unit',
+    env: {'N00B_GC_PIN_ALL': '0'})
+
+# n00b#539: the mark resolves pointer words from its scan tree's records, not
+# from searches of the global mmap tree.
+gc_mark_registry_lookups_test = executable('test_gc_mark_registry_lookups',
+    ['test/unit/test_gc_mark_registry_lookups.c'],
+    kwargs: test_common_kwargs,
+)
+test('gc_mark_registry_lookups_pin_all',
+    gc_mark_registry_lookups_test,
+    suite: 'unit',
+    env: {'N00B_GC_PIN_ALL': '1'})
+test('gc_mark_registry_lookups_copying',
+    gc_mark_registry_lookups_test,
+    suite: 'unit',
+    env: {'N00B_GC_PIN_ALL': '0'})
+
 # n00b#213: n00b_check_kernel_page_map caches "something is mapped here" by
 # registering the probed page, and nothing ever unregisters it -- the one
 # registration site in the process with no counterpart. The cache is now
@@ -4359,6 +4397,13 @@ test('print', print_test, suite: 'unit')
 # Runtime code that writes stdout or stderr has to survive a short write.
 test('lint_raw_writes', python3,
     args: [files('scripts/lint_raw_writes.py'), meson.project_source_root()],
+    suite: 'lint',
+)
+
+# n00b#539: an interior-pointer resolution walks back to its allocation's
+# guard; called once per scanned word it is quadratic in object size.
+test('lint_interior_resolution', python3,
+    args: [files('scripts/lint_interior_resolution.py'), meson.project_source_root()],
     suite: 'lint',
 )
 

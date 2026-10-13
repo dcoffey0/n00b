@@ -326,8 +326,10 @@ static void n00b_add_described_scan_range_to_worklist(n00b_collect_t     *ctx,
 static void        n00b_pin_bitmaps_alloc(n00b_collect_t *ctx);
 static void        n00b_pin_candidate(n00b_collect_t *ctx, void *candidate);
 static void        n00b_pin_prepass(n00b_collect_t *ctx);
-static void        n00b_pin_object_pages(n00b_collect_t *ctx, n00b_alloc_info_t ainfo);
-static bool        n00b_alloc_is_pinned(n00b_collect_t *ctx, n00b_alloc_info_t ainfo);
+static void
+n00b_pin_object_pages(n00b_collect_t *ctx, n00b_segment_t *hint, n00b_alloc_info_t ainfo);
+static bool
+n00b_alloc_is_pinned(n00b_collect_t *ctx, n00b_segment_t *hint, n00b_alloc_info_t ainfo);
 static void        n00b_scan_pinned_in_place(n00b_collect_t *ctx, n00b_alloc_info_t ainfo);
 static void        n00b_reclaim_pinned_pages(n00b_collect_t *ctx, n00b_segment_t *from_chain);
 static void        gc_audit_segment_chain(n00b_arena_t *arena, const char *when);
@@ -2001,6 +2003,8 @@ n00b_process_worklist(n00b_collect_t *ctx)
 typedef struct {
     n00b_allocator_t *allocator;
     n00b_segment_t   *segment; // The arena segment; null for a pool page.
+    n00b_mmap_info_t *map;     // The range's registry record; a pool page's is
+                               // looked up on the first hit.
 } n00b_scan_owner_t;
 
 static void
@@ -2046,7 +2050,9 @@ n00b_scan_tree_add_allocator(n00b_allocator_t *al, void *arg)
                     tree,
                     lo,
                     hi,
-                    ((n00b_scan_owner_t){.allocator = al, .segment = seg}));
+                    ((n00b_scan_owner_t){.allocator = al,
+                                         .segment   = seg,
+                                         .map       = seg->mmap_rec}));
             }
             seg = seg->next_segment;
         }
@@ -2266,11 +2272,27 @@ n00b_visit_possible_pointer(n00b_collect_t *ctx, uint64_t **base, size_t i, bool
 
     // Hit: `word` lands inside a gc-scannable arena/pool segment.  Resolve its
     // header (statics never reach here — they are answered by the static tree
-    // above, so no static-range guard is needed).
-    auto ainfo = n00b_find_alloc_info(word);
+    // above, so no static-range guard is needed).  The hit carries its range's
+    // registry record, found on a pool page's first hit, so the lookup skips
+    // the global mmap tree.  Heap ranges hold still while the world is stopped,
+    // so their backward walks can share the memo; the to-space is the one being
+    // filled.
+    if (owner->map == nullptr && owner->segment == nullptr) {
+        auto map_opt = n00b_mmap_by_address(word);
+        if (n00b_option_is_set(map_opt)) {
+            owner->map = n00b_option_get(map_opt);
+        }
+    }
+
+    n00b_mmap_info_t  *map  = owner->map;
+    n00b_guard_memo_t *memo = owner->allocator != (n00b_allocator_t *)ctx->to_space
+                                ? &ctx->guard_memo
+                                : nullptr;
+
+    auto ainfo = n00b_find_alloc_info_in(word, map, false, nullptr);
 
     if (!n00b_alloc_info_is_heap(ainfo)) {
-        ainfo = n00b_find_alloc_info(word, .scan_for_header = true);
+        ainfo = n00b_find_alloc_info_in(word, map, true, memo);
 
         if (!n00b_alloc_info_is_heap(ainfo)) {
             // Interior pointer into an accepted segment's free space — no live
@@ -2309,7 +2331,7 @@ n00b_visit_possible_pointer(n00b_collect_t *ctx, uint64_t **base, size_t i, bool
             // word is rewritten, so a data word that merely aliases a
             // from-space address (`producer_id << 32 | magic`, `head << 32 |
             // cap`, a lock's packed fields) survives the collection intact.
-            if (ctx->pin_all || n00b_alloc_is_pinned(ctx, ainfo)) {
+            if (ctx->pin_all || n00b_alloc_is_pinned(ctx, owner->segment, ainfo)) {
                 // Ambiguous-root pinned: keep in place.  The sentinel
                 // fw_hdr == old_hdr marks "pinned" for this and every
                 // subsequent visit.  Pin ALL of this object's pages first so a
@@ -2318,7 +2340,7 @@ n00b_visit_possible_pointer(n00b_collect_t *ctx, uint64_t **base, size_t i, bool
                 // and those in-place slots get rewritten) but do NOT copy it
                 // and do NOT rewrite the referring slot.
                 fw_hdr = old_hdr;
-                n00b_pin_object_pages(ctx, ainfo);
+                n00b_pin_object_pages(ctx, owner->segment, ainfo);
                 n00b_scan_pinned_in_place(ctx, ainfo);
             }
             else {
@@ -3080,12 +3102,22 @@ n00b_from_segment_for(n00b_collect_t *ctx, char *addr)
     return nullptr;
 }
 
+// The from-space segment holding `addr`: `hint` when it does, else a lookup.
+static inline n00b_segment_t *
+n00b_from_segment_hinted(n00b_collect_t *ctx, n00b_segment_t *hint, char *addr)
+{
+    if (hint != nullptr && addr >= hint->data && addr < hint->data + hint->size) {
+        return hint;
+    }
+    return n00b_from_segment_for(ctx, addr);
+}
+
 // Mark EVERY page of `ainfo`'s in-arena footprint pinned.  Used both by the
 // register pre-pass and, during forwarding, to retain the full footprint of any
 // object kept in place — so a page-spanning kept object never has a tail page
 // returned to the kernel.
 static void
-n00b_pin_object_pages(n00b_collect_t *ctx, n00b_alloc_info_t ainfo)
+n00b_pin_object_pages(n00b_collect_t *ctx, n00b_segment_t *hint, n00b_alloc_info_t ainfo)
 {
     char    *fs;
     uint64_t fl;
@@ -3093,7 +3125,7 @@ n00b_pin_object_pages(n00b_collect_t *ctx, n00b_alloc_info_t ainfo)
     if (!fs || fl == 0) {
         return;
     }
-    n00b_segment_t *seg = n00b_from_segment_for(ctx, fs);
+    n00b_segment_t *seg = n00b_from_segment_hinted(ctx, hint, fs);
     if (!seg || !seg->pin_bitmap) {
         return;
     }
@@ -3155,7 +3187,8 @@ n00b_pin_candidate(n00b_collect_t *ctx, void *candidate)
         return;
     }
     // Only addresses in a segment of the arena we are collecting can pin.
-    if (n00b_from_segment_for(ctx, candidate) == nullptr) {
+    n00b_segment_t *seg = n00b_from_segment_for(ctx, candidate);
+    if (seg == nullptr) {
         return;
     }
 
@@ -3164,7 +3197,7 @@ n00b_pin_candidate(n00b_collect_t *ctx, void *candidate)
         return;
     }
 
-    n00b_pin_object_pages(ctx, ainfo);
+    n00b_pin_object_pages(ctx, seg, ainfo);
 }
 
 // Pin pre-pass: BEFORE any forwarding, pin the objects implicated by every
@@ -3219,7 +3252,7 @@ n00b_pin_prepass(n00b_collect_t *ctx)
 // that overlaps a pinned page get kept in place — and the caller then pins its
 // remaining pages so reclaim retains the entire object.
 static bool
-n00b_alloc_is_pinned(n00b_collect_t *ctx, n00b_alloc_info_t ainfo)
+n00b_alloc_is_pinned(n00b_collect_t *ctx, n00b_segment_t *hint, n00b_alloc_info_t ainfo)
 {
     char    *fs;
     uint64_t fl;
@@ -3227,7 +3260,7 @@ n00b_alloc_is_pinned(n00b_collect_t *ctx, n00b_alloc_info_t ainfo)
     if (!fs || fl == 0) {
         return false;
     }
-    n00b_segment_t *seg = n00b_from_segment_for(ctx, fs);
+    n00b_segment_t *seg = n00b_from_segment_hinted(ctx, hint, fs);
     if (!seg || !seg->pin_bitmap) {
         return false;
     }
@@ -3887,7 +3920,17 @@ n00b_collect_setup(n00b_collect_t *ctx, n00b_arena_t *from_space, bool out_of_me
                            .hash           = n00b_hash_word,
                            .skip_obj_hash  = true,
                            .scan_kind      = N00B_GC_SCAN_KIND_NONE);
+
+    n00b_dict_untyped_init(&ctx->guard_memo.pages,
+                           .start_capacity = N00B_GC_WL_START_SIZE,
+                           .allocator      = wa,
+                           .hash           = n00b_hash_word,
+                           .skip_obj_hash  = true,
+                           .scan_kind      = N00B_GC_SCAN_KIND_NONE);
     // clang-format on
+    ctx->guard_memo.allocator  = wa;
+    ctx->guard_memo.last_page  = 0;
+    ctx->guard_memo.last_lines = nullptr;
 
     // If from-space uses OOB metadata, back the forwarding dict with TO-space's
     // OWN metadata arena (attached by n00b_new_arena above). Every moved
