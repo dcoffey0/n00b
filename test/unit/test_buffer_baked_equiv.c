@@ -18,17 +18,19 @@
 static void
 set_cached_hash(void *obj, n00b_uint128_t hash)
 {
-    n00b_alloc_info_t info = n00b_find_alloc_info(obj);
+    bool              pin  = false;
+    n00b_alloc_info_t info = n00b_find_alloc_info(obj, .pin = &pin);
     if (info.kind == n00b_alloc_oob) {
         info.hdr.oob->cached_hash = hash;
         if (info.hdr.oob->hcur != nullptr) {
             info.hdr.oob->hcur->cached_hash = hash;
         }
-        return;
     }
-
-    CHECK(info.kind == n00b_alloc_inline);
-    info.hdr.in_line->cached_hash = hash;
+    else {
+        CHECK(info.kind == n00b_alloc_inline);
+        info.hdr.in_line->cached_hash = hash;
+    }
+    n00b_alloc_hdr_unpin(pin);
 }
 
 static n00b_buffer_t *

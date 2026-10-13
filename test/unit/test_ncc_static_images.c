@@ -182,24 +182,29 @@ typedef struct {
 static test_alloc_fields_t
 heap_alloc_fields(void *ptr)
 {
-    n00b_alloc_info_t info = n00b_find_alloc_info(ptr);
+    bool                pin  = false;
+    n00b_alloc_info_t   info = n00b_find_alloc_info(ptr, .pin = &pin);
+    test_alloc_fields_t fields;
     assert(n00b_alloc_info_is_heap(info));
 
     if (info.kind == n00b_alloc_inline) {
-        return (test_alloc_fields_t){
+        fields = (test_alloc_fields_t){
             .tinfo       = info.hdr.in_line->tinfo,
             .alloc_len   = info.hdr.in_line->alloc_len,
             .scan_kind   = (n00b_gc_scan_kind_t)info.hdr.in_line->scan_kind,
             .cached_hash = info.hdr.in_line->cached_hash,
         };
     }
-
-    return (test_alloc_fields_t){
-        .tinfo       = info.hdr.oob->tinfo,
-        .alloc_len   = info.hdr.oob->alloc_len,
-        .scan_kind   = (n00b_gc_scan_kind_t)info.hdr.oob->scan_kind,
-        .cached_hash = info.hdr.oob->cached_hash,
-    };
+    else {
+        fields = (test_alloc_fields_t){
+            .tinfo       = info.hdr.oob->tinfo,
+            .alloc_len   = info.hdr.oob->alloc_len,
+            .scan_kind   = (n00b_gc_scan_kind_t)info.hdr.oob->scan_kind,
+            .cached_hash = info.hdr.oob->cached_hash,
+        };
+    }
+    n00b_alloc_hdr_unpin(pin);
+    return fields;
 }
 
 static void

@@ -586,48 +586,57 @@ assert_failed_inplace_relocate_discards_deferred_patch(n00b_buffer_t *buf,
 static void
 set_ptr_words(void *obj, uint32_t ptr_words)
 {
-    n00b_alloc_info_t info = n00b_find_alloc_info(obj);
+    bool              pin  = false;
+    n00b_alloc_info_t info = n00b_find_alloc_info(obj, .pin = &pin);
 
     if (info.kind == n00b_alloc_oob) {
         info.hdr.oob->ptr_words = ptr_words;
         if (info.hdr.oob->hcur) {
             info.hdr.oob->hcur->ptr_words = ptr_words;
         }
-        return;
     }
-
-    assert(info.kind == n00b_alloc_inline);
-    info.hdr.in_line->ptr_words = ptr_words;
+    else {
+        assert(info.kind == n00b_alloc_inline);
+        info.hdr.in_line->ptr_words = ptr_words;
+    }
+    n00b_alloc_hdr_unpin(pin);
 }
 
 static void
 set_cached_hash(void *obj, n00b_uint128_t cached_hash)
 {
-    n00b_alloc_info_t info = n00b_find_alloc_info(obj);
+    bool              pin  = false;
+    n00b_alloc_info_t info = n00b_find_alloc_info(obj, .pin = &pin);
 
     if (info.kind == n00b_alloc_oob) {
         info.hdr.oob->cached_hash = cached_hash;
         if (info.hdr.oob->hcur) {
             info.hdr.oob->hcur->cached_hash = cached_hash;
         }
-        return;
     }
-
-    assert(info.kind == n00b_alloc_inline);
-    info.hdr.in_line->cached_hash = cached_hash;
+    else {
+        assert(info.kind == n00b_alloc_inline);
+        info.hdr.in_line->cached_hash = cached_hash;
+    }
+    n00b_alloc_hdr_unpin(pin);
 }
 
 static n00b_uint128_t
 get_cached_hash(void *obj)
 {
-    n00b_alloc_info_t info = n00b_find_alloc_info(obj);
+    bool              pin  = false;
+    n00b_alloc_info_t info = n00b_find_alloc_info(obj, .pin = &pin);
+    n00b_uint128_t    hv;
 
     if (info.kind == n00b_alloc_oob) {
-        return info.hdr.oob->cached_hash;
+        hv = info.hdr.oob->cached_hash;
     }
-
-    assert(info.kind == n00b_alloc_inline);
-    return info.hdr.in_line->cached_hash;
+    else {
+        assert(info.kind == n00b_alloc_inline);
+        hv = info.hdr.in_line->cached_hash;
+    }
+    n00b_alloc_hdr_unpin(pin);
+    return hv;
 }
 
 static n00b_alloc_range_t *
@@ -1024,7 +1033,8 @@ test_ptr_words_limits_scan_extent(void)
     assert(copy->scalar_tail == (uint64_t)(uintptr_t)decoy);
     assert(copy->scalar_tail != (uint64_t)(uintptr_t)copy->real_ptr);
 
-    n00b_alloc_info_t copy_info = n00b_find_alloc_info(copy);
+    bool              copy_pin  = false;
+    n00b_alloc_info_t copy_info = n00b_find_alloc_info(copy, .pin = &copy_pin);
     if (copy_info.kind == n00b_alloc_oob) {
         assert(copy_info.hdr.oob->ptr_words == 1);
     }
@@ -1032,6 +1042,7 @@ test_ptr_words_limits_scan_extent(void)
         assert(copy_info.kind == n00b_alloc_inline);
         assert(copy_info.hdr.in_line->ptr_words == 1);
     }
+    n00b_alloc_hdr_unpin(copy_pin);
 
 }
 

@@ -2853,6 +2853,17 @@ arena_segment_stw_race_test = executable('test_arena_segment_stw_race',
 test('arena_segment_stw_race', arena_segment_stw_race_test, suite: 'unit',
      timeout: 180)
 
+# An allocation header used across a collection. POSIX-only: the guard case
+# re-runs the binary with fork and exec.
+if target_os != 'windows'
+alloc_hdr_stw_race_test = executable('test_alloc_hdr_stw_race',
+    ['test/unit/test_alloc_hdr_stw_race.c'],
+    kwargs: test_common_kwargs,
+)
+test('alloc_hdr_stw_race', alloc_hdr_stw_race_test, suite: 'unit',
+     timeout: 120)
+endif
+
 # n00b-lang/n00b#432: the marshal's private scratch pool must stay within a
 # small multiple of the image it produces.  It used to retain one block per
 # marshaled allocation plus every superseded half of the output buffer, which on

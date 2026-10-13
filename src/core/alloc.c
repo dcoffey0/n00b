@@ -50,6 +50,29 @@ n00b_metadata_gate_unlock(bool unlock_gate)
     }
 }
 
+void
+n00b_alloc_hdr_unpin(bool pinned)
+{
+    n00b_metadata_gate_unlock(pinned);
+}
+
+#if defined(N00B_DEBUG)
+void (*n00b_alloc_hdr_lookup_hook)(void *addr) = nullptr;
+
+// A thread without a TCB has no read log, so whether it holds the gate cannot
+// be checked; only a thread with one is held to it.
+static bool
+alloc_hdr_use_is_pinned(void)
+{
+    n00b_thread_t *self = n00b_thread_self();
+
+    if (self == nullptr || self->record == nullptr) {
+        return true;
+    }
+    return n00b_rw_held_by_self(&n00b_get_runtime()->critical_execution);
+}
+#endif
+
 #include "core/oob_md_dict.h"
 
 static inline n00b_oob_hdr_t *
@@ -638,7 +661,7 @@ _n00b_alloc_raw(size_t             n,
             .scan_cb         = opts->scan_cb,
             .scan_user       = opts->scan_user,
             .hcur            = hdr,
-            .file_name       = location,
+            .file_name       = opts->alloc_site ? opts->alloc_site : location,
             .gc_epoch        = epoch_now,
             .alive           = 1,
             .finalizer       = opts->finalizer,
@@ -1313,8 +1336,11 @@ type_cleanup:;
         n00b_rwlock_t **lock_ptr = (n00b_rwlock_t **)((char *)ptr + offset);
         n00b_rwlock_t  *lock_val = *lock_ptr;
         if (lock_val) {
-            n00b_alloc_info_t lock_info = n00b_find_alloc_info(lock_val);
-            if (n00b_alloc_info_is_heap(lock_info)) {
+            bool pin  = false;
+            bool heap = n00b_alloc_info_is_heap(
+                n00b_find_alloc_info(lock_val, .pin = &pin));
+            n00b_alloc_hdr_unpin(pin);
+            if (heap) {
                 n00b_free(lock_val);
             }
             *lock_ptr = nullptr;
@@ -1755,7 +1781,8 @@ find_alloc_info(void                *addr,
                 n00b_alloc_info_t   *result,
                 bool                 scan_for_header,
                 n00b_guard_memo_t   *guard_memo,
-                n00b_mmap_info_t    *mmap)
+                n00b_mmap_info_t    *mmap,
+                bool                *pin)
 {
     char *p = (char *)addr;
 
@@ -1830,7 +1857,12 @@ find_alloc_info(void                *addr,
                 n00b_rw_read_lock(&n00b_get_runtime()->critical_execution);
             }
             n00b_oob_hdr_t *oob = n00b_md_get(al->metadata, addr);
-            if (md_stw) {
+            // A caller that asked for a pin keeps the gate across its use of
+            // the header and releases it with n00b_alloc_hdr_unpin.
+            if (md_stw && oob != nullptr && pin != nullptr) {
+                *pin = true;
+            }
+            else if (md_stw) {
                 n00b_rw_unlock(&n00b_get_runtime()->critical_execution);
             }
             if (!oob) {
@@ -1841,6 +1873,14 @@ find_alloc_info(void                *addr,
                 };
                 return;
             }
+#if defined(N00B_DEBUG)
+            if (md_stw) {
+                n00b_assert(alloc_hdr_use_is_pinned());
+                if (n00b_alloc_hdr_lookup_hook != nullptr) {
+                    n00b_alloc_hdr_lookup_hook(addr);
+                }
+            }
+#endif
             *result = (n00b_alloc_info_t){
                 .kind    = n00b_alloc_oob,
                 .hdr.oob = oob,
@@ -1875,9 +1915,13 @@ _n00b_find_alloc_info(void *addr, n00b_alloc_info_t *result) _kargs
 {
     n00b_allocator_t *allocator       = nullptr;
     bool              scan_for_header = false;
+    bool             *pin             = nullptr;
 }
 {
-    find_alloc_info(addr, result, scan_for_header, nullptr, nullptr);
+    if (pin != nullptr) {
+        *pin = false;
+    }
+    find_alloc_info(addr, result, scan_for_header, nullptr, nullptr, pin);
 }
 
 [[n00b::nogc]] n00b_alloc_info_t
@@ -1888,7 +1932,7 @@ n00b_find_alloc_info_in(void              *addr,
 {
     n00b_alloc_info_t result;
 
-    find_alloc_info(addr, &result, scan_for_header, guard_memo, mmap);
+    find_alloc_info(addr, &result, scan_for_header, guard_memo, mmap, nullptr);
     return result;
 }
 
@@ -1901,10 +1945,11 @@ n00b_find_alloc_info_in(void              *addr,
 // kind=n00b_alloc_none on a miss so the caller can fall back to the global path.
 // Only valid for external-metadata allocators without inline headers (the inline
 // case needs the page's mmap->start to bound the header scan); returns none
-// otherwise.
+// otherwise. `pin` works as it does for n00b_find_alloc_info.
 n00b_alloc_info_t
-n00b_try_alloc_info_in_allocator(void *addr, n00b_allocator_t *al)
+n00b_try_alloc_info_in_allocator(void *addr, n00b_allocator_t *al, bool *pin)
 {
+    *pin = false;
     if (al == nullptr || al->metadata == nullptr || al->add_inline_header) {
         return (n00b_alloc_info_t){.kind = n00b_alloc_none};
     }
@@ -1914,7 +1959,10 @@ n00b_try_alloc_info_in_allocator(void *addr, n00b_allocator_t *al)
         n00b_rw_read_lock(&n00b_get_runtime()->critical_execution);
     }
     n00b_oob_hdr_t *oob = n00b_md_get(al->metadata, addr);
-    if (md_stw) {
+    if (md_stw && oob != nullptr) {
+        *pin = true;
+    }
+    else if (md_stw) {
         n00b_rw_unlock(&n00b_get_runtime()->critical_execution);
     }
 

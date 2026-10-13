@@ -66,7 +66,10 @@ assert_type_layout_scan(void                         *ptr,
                         const n00b_gc_struct_layout_t *layout,
                         uint32_t                      expected_ptr_words)
 {
-    n00b_alloc_info_t info = n00b_find_alloc_info(ptr, .scan_for_header = true);
+    bool              pin  = false;
+    n00b_alloc_info_t info = n00b_find_alloc_info(ptr,
+                                                  .scan_for_header = true,
+                                                  .pin             = &pin);
 
     CHECK(info.kind == n00b_alloc_oob);
     CHECK(info.hdr.oob->tinfo == typehash(type_layout_probe_t *));
@@ -75,6 +78,7 @@ assert_type_layout_scan(void                         *ptr,
     CHECK(info.hdr.oob->scan_kind == N00B_GC_SCAN_KIND_CALLBACK);
     CHECK(info.hdr.oob->scan_cb == n00b_gc_scan_cb_type_layout);
     CHECK(info.hdr.oob->scan_user == (void *)layout);
+    n00b_alloc_hdr_unpin(pin);
 }
 
 static void
@@ -127,14 +131,17 @@ test_flex_allocations_keep_default_scan(void)
     CHECK(flex != nullptr);
     flex->count = 2;
 
+    bool              pin  = false;
     n00b_alloc_info_t info = n00b_find_alloc_info(flex,
-                                                  .scan_for_header = true);
+                                                  .scan_for_header = true,
+                                                  .pin             = &pin);
     CHECK(info.kind == n00b_alloc_oob);
     CHECK(info.hdr.oob->tinfo == 0);
     CHECK(info.hdr.oob->ptr_words_known);
     CHECK(info.hdr.oob->scan_kind == N00B_GC_SCAN_KIND_DEFAULT);
     CHECK(info.hdr.oob->scan_cb == nullptr);
     CHECK(info.hdr.oob->scan_user == nullptr);
+    n00b_alloc_hdr_unpin(pin);
 }
 
 static void
@@ -149,13 +156,16 @@ test_type_layout_zero_array_round_trip(void)
         n00b_alloc_array_with_opts(type_layout_probe_t, 0, ARENA_OPTS(arena));
     CHECK(items != nullptr);
 
+    bool              pin  = false;
     n00b_alloc_info_t info = n00b_find_alloc_info(items,
-                                                  .scan_for_header = true);
+                                                  .scan_for_header = true,
+                                                  .pin             = &pin);
     CHECK(info.kind == n00b_alloc_oob);
     CHECK(info.hdr.oob->ptr_words_known);
     CHECK(info.hdr.oob->ptr_words == 0);
     CHECK(info.hdr.oob->scan_kind == N00B_GC_SCAN_KIND_CALLBACK);
     CHECK(info.hdr.oob->scan_cb == n00b_gc_scan_cb_type_layout);
+    n00b_alloc_hdr_unpin(pin);
 
     uint32_t       base = 0x30313233u;
     n00b_buffer_t *buf  = marshal_checked(items, base);
@@ -181,14 +191,17 @@ test_type_layout_large_array_records_logical_words(void)
         n00b_alloc_array_with_opts(type_layout_probe_t, count, ARENA_OPTS(arena));
     CHECK(items != nullptr);
 
+    bool              pin  = false;
     n00b_alloc_info_t info = n00b_find_alloc_info(items,
-                                                  .scan_for_header = true);
+                                                  .scan_for_header = true,
+                                                  .pin             = &pin);
     CHECK(info.kind == n00b_alloc_oob);
     CHECK(info.hdr.oob->ptr_words_known);
     CHECK(info.hdr.oob->ptr_words == expected);
     CHECK(info.hdr.oob->ptr_words > (UINT32_C(1) << 20));
     CHECK(info.hdr.oob->scan_kind == N00B_GC_SCAN_KIND_CALLBACK);
     CHECK(info.hdr.oob->scan_cb == n00b_gc_scan_cb_type_layout);
+    n00b_alloc_hdr_unpin(pin);
 
     uint32_t       base = 0x34353637u;
     n00b_buffer_t *buf  = marshal_checked(items, base);
@@ -232,8 +245,10 @@ test_type_layout_grown_backing_round_trip(void)
     }
     CHECK(list.cap > N00B_DEFAULT_LIST_SZ);
 
+    bool              backing_pin  = false;
     n00b_alloc_info_t backing_info = n00b_find_alloc_info(list.data,
-                                                          .scan_for_header = true);
+                                                          .scan_for_header = true,
+                                                          .pin             = &backing_pin);
     CHECK(backing_info.kind == n00b_alloc_oob);
     // The grown backing array must keep the type-layout scan callback and
     // descriptor. Its raw backing-store tinfo may be a compiler-generated
@@ -246,6 +261,7 @@ test_type_layout_grown_backing_round_trip(void)
     CHECK(backing_info.hdr.oob->scan_kind == N00B_GC_SCAN_KIND_CALLBACK);
     CHECK(backing_info.hdr.oob->scan_cb == n00b_gc_scan_cb_type_layout);
     CHECK(backing_info.hdr.oob->scan_user == (void *)layout);
+    n00b_alloc_hdr_unpin(backing_pin);
 
     uint32_t       base = 0x61626364u;
     n00b_buffer_t *buf  = marshal_checked(list.data, base);
