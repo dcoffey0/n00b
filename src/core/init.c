@@ -470,11 +470,14 @@ n00b_init_core(n00b_runtime_t *rt, int argc, char *argv[]) _kargs
                    .name              = "runtime_obj_pool");
 
     n00b_allocator_t *rpool = (n00b_allocator_t *)&rt->system_pool;
-    rt->gc_roots            = n00b_list_new(n00b_gc_root_t, .allocator = rpool);
+    // Locked below, once data locks can be made.
+    rt->gc_roots            = n00b_list_new_private(n00b_gc_root_t, .allocator = rpool);
     n00b_finalizer_index_init(rt);
     /* See runtime.h: every external_metadata pool registers here so
-     * the GC mark phase can walk per-alloc metadata directly. */
-    rt->metadata_pools = n00b_list_new(n00b_allocator_t *, .allocator = rpool);
+     * the GC mark phase can walk per-alloc metadata directly. Unlocked:
+     * nothing in libn00b writes it after this, and the collector reads it
+     * with the world stopped. */
+    rt->metadata_pools = n00b_list_new_private(n00b_allocator_t *, .allocator = rpool);
     n00b_atomic_store(&rt->gc_current_epoch, 0);
     n00b_atomic_store(&rt->debug_leak_detect, false);
 
@@ -484,6 +487,10 @@ n00b_init_core(n00b_runtime_t *rt, int argc, char *argv[]) _kargs
     _n00b_gc_register_static_roots();
 
     setup_threads(rt, max_threads);
+    n00b_atomic_store(&rt->threads_may_exist, true);
+    // Roots are registered from any thread. Only this one exists yet, so the
+    // lock can go in now.
+    rt->gc_roots.lock = n00b_data_lock_new();
 
     if (allocator) {
         rt->default_allocator = allocator;

@@ -303,10 +303,8 @@ main(int argc, char **argv)
     assert(drained_ok);
 
     printf("\nAll print contention tests passed.\n");
-    // Flush before shutdown: if shutdown aborts (it does, intermittently --
-    // n00b#409), an unflushed block-buffered stdout takes the whole verdict
-    // with it, and the run reads as "produced no output" rather than
-    // "passed, then died on the way out".
+    // Flush before shutdown, so an abort there cannot take the verdict with
+    // a block-buffered stdout.
     fflush(stdout);
     n00b_shutdown();
     return 0;

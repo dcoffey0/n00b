@@ -220,6 +220,15 @@ extern bool n00b_debug_census_on_collect_enabled(void);
  */
 extern void _n00b_gc_register_root(void *addr, size_t num_words);
 
+#ifdef N00B_DEBUG
+/**
+ * @brief Called by @ref _n00b_gc_register_root with @p addr while it holds
+ *        the root list's lock, before it reads the list. Only under
+ *        @c N00B_DEBUG.
+ */
+extern void (*n00b_gc_register_root_hook)(void *addr);
+#endif
+
 /**
  * @brief Bulk-register an array of GC roots in one call.
  *

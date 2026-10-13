@@ -2922,6 +2922,10 @@ extern const n00b_gc_root_section_entry_t __start_n00b_gcroots[] __attribute__((
 extern const n00b_gc_root_section_entry_t __stop_n00b_gcroots[] __attribute__((weak));
 #endif
 
+#ifdef N00B_DEBUG
+void (*n00b_gc_register_root_hook)(void *) = nullptr;
+#endif
+
 void
 _n00b_gc_register_root(void *addr, size_t num_words)
 {
@@ -2933,6 +2937,11 @@ _n00b_gc_register_root(void *addr, size_t num_words)
     auto            roots = &rt->gc_roots;
 
     n00b_data_write_lock(roots->lock);
+#ifdef N00B_DEBUG
+    if (n00b_gc_register_root_hook != nullptr) {
+        n00b_gc_register_root_hook(addr);
+    }
+#endif
 
     for (size_t i = 0; i < roots->len; i++) {
         n00b_gc_root_t existing = roots->data[i];

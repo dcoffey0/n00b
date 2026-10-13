@@ -377,3 +377,7 @@ _n00b_conduit_topic_notify_publisher_lost(n00b_conduit_topic_base_t *topic)
     topic_notify_all(topic, N00B_CONDUIT_MSG_PUBLISHER_LOST);
     if (lock) n00b_data_unlock(lock);
 }
+
+#ifdef N00B_DEBUG
+void (*n00b_conduit_topic_deliver_hook)(n00b_conduit_topic_base_t *, void *) = nullptr;
+#endif

@@ -33,8 +33,15 @@ typedef struct n00b_pool_page_t {
     uint32_t                 interpose_slot;
 } n00b_pool_page_t;
 
+typedef struct n00b_pool_t n00b_pool_t;
+
+// The header before every pool allocation. owner tags the pool's slot in
+// the pool registry, which is how n00b_free finds a pool whose pages stay
+// out of the mmap tree (pool.c).
 typedef struct {
     unsigned int list_index;
+    uint32_t     owner;
+    n00b_pool_t *pool;
 } n00b_pool_entry_t;
 
 // Last-unref hook for .pool_refcount pools. A single-token typedef so it can be
@@ -97,6 +104,12 @@ struct n00b_pool_t {
     // comes back down.
     bool                  alloc_audit;
     _Atomic(void *)       alloc_audit_dict;
+    // The pool's slot in the pool registry, or UINT32_MAX when the registry
+    // was full. Every allocation's header carries it (n00b_pool_entry_t).
+    uint32_t              registry_slot;
+    // Set when the pool's pages stay out of the mmap tree, so n00b_free
+    // finds the pool through the allocation header.
+    bool                  unlisted;
 };
 
 typedef struct n00b_pool_t n00b_pool_t;
@@ -348,6 +361,16 @@ extern void n00b_alloc_unref(void *ptr);
  * the pool's owner is suspended (it never touches the pool lock).
  */
 extern uint64_t n00b_pool_mapped_bytes(n00b_pool_t *pool);
+
+/**
+ * @brief The pool @p ptr came from when that pool keeps its pages out of
+ *        the mmap tree (the system pool and other hidden pools), or nullptr.
+ *
+ * @p ptr must be the address an allocation returned. n00b_free uses this
+ * when the mmap tree knows no owner. A pool made while the pool registry
+ * was full (n00b_pool_global_stats().registry_overflow_count) is not found.
+ */
+extern n00b_allocator_t *n00b_pool_unlisted_owner(void *ptr);
 
 /**
  * @brief Highest value @ref n00b_pool_mapped_bytes has ever reported for this

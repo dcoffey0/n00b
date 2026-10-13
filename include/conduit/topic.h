@@ -262,6 +262,25 @@ typedef struct n00b_conduit_topic_base {
  *
  * @pre N00B_CONDUIT_SUBSCRIPTION_IMPL(T) must have been called.
  */
+#ifdef N00B_DEBUG
+/**
+ * @brief Called by every typed delivery for each subscription, after it has
+ *        read the subscription's state and before it acts on it, while it
+ *        holds the topic's subscription list. Only under @c N00B_DEBUG.
+ */
+extern void (*n00b_conduit_topic_deliver_hook)(n00b_conduit_topic_base_t *topic,
+                                                void                      *sub);
+#define _N00B_TOPIC_DELIVER_HOOK(topic, sub)                                     \
+    do {                                                                         \
+        if (n00b_conduit_topic_deliver_hook != nullptr) {                        \
+            n00b_conduit_topic_deliver_hook((n00b_conduit_topic_base_t *)(topic), \
+                                            (void *)(sub));                       \
+        }                                                                        \
+    } while (0)
+#else
+#define _N00B_TOPIC_DELIVER_HOOK(topic, sub) ((void)0)
+#endif
+
 #define N00B_CONDUIT_TOPIC_IMPL(T)                                                             \
     n00b_conduit_topic_t(T) {                                                                  \
         /* Common fields — same layout as n00b_conduit_topic_base_t */                         \
@@ -307,6 +326,7 @@ typedef struct n00b_conduit_topic_base {
             if (!sub)                                                                           \
                 continue;                                                                      \
             int _state = n00b_atomic_load(&sub->state);                                        \
+            _N00B_TOPIC_DELIVER_HOOK(topic, sub);                                              \
             if (_state == N00B_CONDUIT_SUB_REMOVED)                                            \
                 continue;                                                                      \
             if (_state == N00B_CONDUIT_SUB_ACTIVE &&                                           \

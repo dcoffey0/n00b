@@ -195,7 +195,7 @@
     })
 
 /**
- * @brief Free the backing storage of a list and zero the struct.
+ * @brief Free the backing storage and the lock of a list and zero the struct.
  * @param x  List (lvalue).
  */
 #define n00b_list_free(x)                                                                      \
@@ -212,6 +212,9 @@
             else {                                                                             \
                 n00b_free(_bl_lp->data);                                                       \
             }                                                                                  \
+        }                                                                                      \
+        if (_bl_lp->lock) {                                                                    \
+            n00b_finalize_data_lock(_bl_lp->lock);                                             \
         }                                                                                      \
         *_bl_lp = (typeof(x)){};                                                               \
     })

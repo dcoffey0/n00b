@@ -37,9 +37,8 @@ extern void n00b_lock_chains_scrub_pool(n00b_pool_t *pool);
 // `pool`, so registration can never block — the GC collector registers its
 // work pool DURING stop-the-world, where waiting on any lock a suspended
 // thread might hold is a deadlock. `name` is published after the claiming
-// CAS; any future reader must tolerate a null/stale name on a just-claimed
-// slot (there are currently no readers — the registry-walking stats were
-// removed; a reader brought back later should use pinned reads).
+// CAS; a reader must tolerate a null/stale name on a just-claimed slot.
+// n00b_pool_unlisted_owner reads only `pool`, one slot per lookup.
 typedef struct {
     _Atomic(n00b_pool_t *) pool;
     _Atomic(const char *)  name;
@@ -802,13 +801,10 @@ pool_unlock(n00b_pool_t *pool)
     n00b_atomic_store(&pool->lock, 0);
 }
 
-static void
+// Returns the claimed slot, or UINT32_MAX when the registry is full.
+static uint32_t
 pool_registry_register(n00b_pool_t *pool, const char *name)
 {
-    if (pool == nullptr) {
-        return;
-    }
-
     atomic_fetch_add(&n00b_pool_registry_init_count, 1);
 
     for (uint64_t i = 0; i < N00B_POOL_GLOBAL_REGISTRY_MAX; i++) {
@@ -818,31 +814,30 @@ pool_registry_register(n00b_pool_t *pool, const char *name)
         n00b_pool_t *expected = nullptr;
         if (n00b_cas(&n00b_pool_registry[i].pool, &expected, pool)) {
             n00b_atomic_store(&n00b_pool_registry[i].name, name);
-            return;
+            return (uint32_t)i;
         }
     }
 
     atomic_fetch_add(&n00b_pool_registry_overflow_count, 1);
+    return UINT32_MAX;
 }
 
 static void
 pool_registry_unregister(n00b_pool_t *pool)
 {
-    if (pool == nullptr) {
+    uint32_t i = pool->registry_slot;
+    if (i >= N00B_POOL_GLOBAL_REGISTRY_MAX
+        || n00b_atomic_load(&n00b_pool_registry[i].pool) != pool) {
         return;
     }
 
     // Only the pool's owner unregisters it, so a plain release of the slot
     // suffices: clear name first so a slot with pool set never carries the
     // wrong name, then release the slot for re-claim.
-    for (uint64_t i = 0; i < N00B_POOL_GLOBAL_REGISTRY_MAX; i++) {
-        if (n00b_atomic_load(&n00b_pool_registry[i].pool) == pool) {
-            n00b_atomic_store(&n00b_pool_registry[i].name, (const char *)nullptr);
-            n00b_atomic_store(&n00b_pool_registry[i].pool, (n00b_pool_t *)nullptr);
-            atomic_fetch_add(&n00b_pool_registry_destroy_count, 1);
-            break;
-        }
-    }
+    pool->registry_slot = UINT32_MAX;
+    n00b_atomic_store(&n00b_pool_registry[i].name, (const char *)nullptr);
+    n00b_atomic_store(&n00b_pool_registry[i].pool, (n00b_pool_t *)nullptr);
+    atomic_fetch_add(&n00b_pool_registry_destroy_count, 1);
 }
 
 // A pool's pages are registered in the global mmap tree (so
@@ -853,9 +848,9 @@ pool_registry_unregister(n00b_pool_t *pool)
 // GC-visible (non-hidden):
 //   - __system pools are bootstrap-critical (registering ctx->pool's
 //     pages recurses through _n00b_alloc_raw) and are excluded.
-//   - hidden, no-metadata, header-less pools are libn00b-internal, use
-//     only the pool_free fast path, and never need address-to-allocator
-//     resolution, so they stay out of the tree.
+//   - hidden, no-metadata, header-less pools are libn00b-internal and stay
+//     out of the tree. n00b_free finds them through the allocation header
+//     (n00b_pool_unlisted_owner).
 //   - everything else — external-metadata pools (incl. hidden ones like
 //     user_pool) and plain non-hidden pools (e.g. a caller's claim pool)
 //     — is registered so n00b_free works.
@@ -872,6 +867,40 @@ pool_pages_registered(n00b_allocator_t *alloc)
 {
     return !alloc->__system
         && (alloc->metadata_pool != nullptr || !alloc->hidden || alloc->add_inline_header);
+}
+
+// An allocation header's owner word: a tag in the high half and the pool's
+// registry slot in the low half, or 0 for a pool the registry could not take.
+#define N00B_POOL_ENTRY_TAG 0xB00Cu
+static_assert(N00B_POOL_GLOBAL_REGISTRY_MAX <= (1u << 16));
+
+[[n00b::nogc]] static inline uint32_t
+pool_entry_owner(n00b_pool_t *pool)
+{
+    uint32_t slot = pool->registry_slot;
+    return slot < N00B_POOL_GLOBAL_REGISTRY_MAX ? (N00B_POOL_ENTRY_TAG << 16) | slot
+                                                 : 0;
+}
+
+n00b_allocator_t *
+n00b_pool_unlisted_owner(void *ptr)
+{
+    if (ptr == nullptr || ((uintptr_t)ptr & (N00B_ALIGN - 1)) != 0) {
+        return nullptr;
+    }
+    n00b_pool_entry_t *entry = (n00b_pool_entry_t *)((char *)ptr - N00B_ALIGN);
+    uint32_t           owner = entry->owner;
+    n00b_pool_t       *pool  = entry->pool;
+    if ((owner >> 16) != N00B_POOL_ENTRY_TAG || pool == nullptr) {
+        return nullptr;
+    }
+    // The slot holding this pool is what makes the header's pool pointer
+    // trustworthy, and it means the pool is live.
+    if (n00b_atomic_load(&n00b_pool_registry[owner & 0xFFFFu].pool) != pool
+        || !pool->unlisted) {
+        return nullptr;
+    }
+    return (n00b_allocator_t *)pool;
 }
 
 #ifdef N00B_POOL_ALLOC_AUDIT
@@ -1839,6 +1868,8 @@ pool_alloc(n00b_pool_t *pool, uint64_t request, void *ignore)
     }
 
     entry->list_index = ix;
+    entry->owner      = pool_entry_owner(pool);
+    entry->pool       = pool;
     void *p           = (void *)(((char *)entry) + N00B_ALIGN);
 
     assert(!(((uint64_t)p) & (N00B_ALIGN - 1)));
@@ -2120,7 +2151,8 @@ n00b_pool_init_at(n00b_pool_t *pool) _kargs
         n00b_llstack_init(&pool->free_lists[i]);
     }
 
-    pool_registry_register(pool, name);
+    pool->unlisted      = !pool_pages_registered((n00b_allocator_t *)pool);
+    pool->registry_slot = pool_registry_register(pool, name);
     // Pools are arenas too for the memory census: track every live pool in the
     // shared allocator audit ring (debug-only; no-op otherwise).
     n00b_allocator_audit_register((n00b_allocator_t *)pool);

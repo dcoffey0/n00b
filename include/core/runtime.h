@@ -71,6 +71,9 @@ struct n00b_runtime_t {
     _Atomic uint32_t            next_thread_slot;
     _Atomic uint32_t            live_threads;
     _Atomic bool                startup_complete;
+    /* Set once thread records exist and before init spawns its first
+     * thread. Data structures created from here on get their rwlock. */
+    _Atomic bool                threads_may_exist;
     /* Set by `n00b_shutdown` before tearing anything down.  Spin-wait
      * helpers (`n00b_futex_wait_for_value`, `n00b_futex_wait_on_mask`)
      * check this and break out instead of looping forever when the
