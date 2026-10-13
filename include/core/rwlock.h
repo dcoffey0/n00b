@@ -69,6 +69,24 @@ extern void _n00b_rw_read_lock(n00b_rwlock_t *, char *);
  */
 extern bool _n00b_rw_unlock(n00b_rwlock_t *, char *);
 
+#ifdef N00B_DEBUG
+/**
+ * @brief Debug-only: the calling thread's count of rwlock write releases,
+ *        each of which wakes the futex.
+ */
+extern uint64_t n00b_rw_debug_write_wakes(void);
+
+/**
+ * @brief Debug-only: the calling thread's count of rwlock read acquisitions.
+ */
+extern uint64_t n00b_rw_debug_read_acquires(void);
+
+/**
+ * @brief Debug-only: the calling thread's count of rwlock write acquisitions.
+ */
+extern uint64_t n00b_rw_debug_write_acquires(void);
+#endif
+
 /**
  * @brief Adopt a record-less reader hold (taken null-self, e.g. at the start of
  *        thread init before the TCB exists) into a TCB read-log record, so that
