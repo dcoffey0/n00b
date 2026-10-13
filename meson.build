@@ -2342,6 +2342,18 @@ test('gc_pool_trace_copying', gc_pool_trace_test, suite: 'unit',
 test('gc_pool_trace_pin_all', gc_pool_trace_test, suite: 'unit',
     env: {'N00B_GC_PIN_ALL': '1'})
 
+# n00b#547: a newest-first reader paging a hot shard while a writer commits
+# batches into it, shaped like crashappsec/wax's rocs_query_race. Collection
+# pressure is on: without it the test collects once or twice and reaches
+# neither defect it was written against.
+rocs_query_race_test = executable('test_rocs_query_race',
+    ['test/unit/test_rocs_query_race.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_query_race', rocs_query_race_test, suite: 'unit',
+    env: {'N00B_QUERY_RACE_SECONDS': '4',
+          'N00B_QUERY_RACE_GC_PRESSURE': '16'})
+
 bench_rocs_catalog_rewrite = executable('bench_rocs_catalog_rewrite',
     ['test/unit/bench_rocs_catalog_rewrite.c'],
     kwargs: test_common_kwargs,
