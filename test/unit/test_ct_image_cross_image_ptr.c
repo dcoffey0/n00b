@@ -61,41 +61,55 @@ static const n00b_static_identity_t target_identity_crt_writable = {
 static void
 set_ptr_words(void *obj, uint32_t ptr_words)
 {
-    n00b_alloc_info_t info = n00b_find_alloc_info(obj);
+    bool              pin  = false;
+    n00b_alloc_info_t info = n00b_find_alloc_info(obj, .pin = &pin);
 
     if (info.kind == n00b_alloc_oob) {
         info.hdr.oob->ptr_words = ptr_words;
         if (info.hdr.oob->hcur != nullptr) {
             info.hdr.oob->hcur->ptr_words = ptr_words;
         }
-        return;
     }
-
-    CHECK(info.kind == n00b_alloc_inline);
-    info.hdr.in_line->ptr_words = ptr_words;
+    else {
+        CHECK(info.kind == n00b_alloc_inline);
+        info.hdr.in_line->ptr_words = ptr_words;
+    }
+    n00b_alloc_hdr_unpin(pin);
 }
 
 static n00b_alloc_type_info_t
 alloc_tinfo(void *obj)
 {
-    n00b_alloc_info_t info = n00b_find_alloc_info(obj);
+    bool                   pin   = false;
+    n00b_alloc_info_t      info  = n00b_find_alloc_info(obj, .pin = &pin);
+    n00b_alloc_type_info_t tinfo;
     if (info.kind == n00b_alloc_oob) {
-        return info.hdr.oob->tinfo;
+        tinfo = info.hdr.oob->tinfo;
     }
-    CHECK(info.kind == n00b_alloc_inline);
-    return info.hdr.in_line->tinfo;
+    else {
+        CHECK(info.kind == n00b_alloc_inline);
+        tinfo = info.hdr.in_line->tinfo;
+    }
+    n00b_alloc_hdr_unpin(pin);
+    return tinfo;
 }
 
 static size_t
 alloc_user_len(void *obj)
 {
-    n00b_alloc_info_t info = n00b_find_alloc_info(obj);
+    bool              pin  = false;
+    n00b_alloc_info_t info = n00b_find_alloc_info(obj, .pin = &pin);
+    size_t            len;
     if (info.kind == n00b_alloc_oob) {
-        return info.hdr.oob->hcur ? info.hdr.oob->alloc_len - N00B_ALLOC_HDR_SZ
-                                  : info.hdr.oob->alloc_len;
+        len = info.hdr.oob->hcur ? info.hdr.oob->alloc_len - N00B_ALLOC_HDR_SZ
+                                 : info.hdr.oob->alloc_len;
     }
-    CHECK(info.kind == n00b_alloc_inline);
-    return info.hdr.in_line->alloc_len - N00B_ALLOC_HDR_SZ;
+    else {
+        CHECK(info.kind == n00b_alloc_inline);
+        len = info.hdr.in_line->alloc_len - N00B_ALLOC_HDR_SZ;
+    }
+    n00b_alloc_hdr_unpin(pin);
+    return len;
 }
 
 static void

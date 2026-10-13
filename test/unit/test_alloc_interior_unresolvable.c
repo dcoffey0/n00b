@@ -59,9 +59,11 @@ test_oob_without_inline_header(void)
     memset(p, 0x5A, 64);
 
     /* The base address resolves normally — the exact-key lookup hits. */
-    n00b_alloc_info_t base = n00b_find_alloc_info(p, .allocator = alloc);
+    bool              pin  = false;
+    n00b_alloc_info_t base = n00b_find_alloc_info(p, .allocator = alloc, .pin = &pin);
     assert(base.kind == n00b_alloc_oob);
     assert(n00b_alloc_info_is_heap(base));
+    n00b_alloc_hdr_unpin(pin);
     printf("  [PASS] base pointer resolves (kind=oob)\n");
 
     /* An interior pointer cannot resolve — but must be distinguishable. */

@@ -319,18 +319,28 @@ test_header_address_false_positive(void)
     printf("  [PASS] conservative header-address false positive\n");
 }
 
-// True when `info` resolves to the allocation whose inline header is `hdr`.
+// True when `addr` resolves to the allocation whose inline header is `hdr`.
 static bool
-alloc_info_is(n00b_alloc_info_t info, n00b_inline_hdr_t *hdr)
+resolves_to(void *addr, n00b_inline_hdr_t *hdr)
 {
+    bool              pin  = false;
+    n00b_alloc_info_t info = n00b_find_alloc_info(addr,
+                                                  .scan_for_header = true,
+                                                  .pin             = &pin);
+    bool              same = false;
+
     switch (info.kind) {
     case n00b_alloc_inline:
-        return info.hdr.in_line == hdr;
+        same = info.hdr.in_line == hdr;
+        break;
     case n00b_alloc_oob:
-        return info.hdr.oob->hcur == hdr;
+        same = info.hdr.oob->hcur == hdr;
+        break;
     default:
-        return false;
+        break;
     }
+    n00b_alloc_hdr_unpin(pin);
+    return same;
 }
 
 // Masked so no scan can take these for pointers and rewrite them.
@@ -482,21 +492,17 @@ test_word_one_past_allocation_end(void)
     n00b_require(end == n00b_atomic_load(&arena->next_alloc),
                  "the object is not the arena's last allocation");
 
-    n00b_require(alloc_info_is(n00b_find_alloc_info(end, .scan_for_header = true),
-                               hdr),
+    n00b_require(resolves_to(end, hdr),
                  "the address one past an allocation did not resolve to it");
     n00b_require(!n00b_alloc_info_is_heap(
                      n00b_find_alloc_info(end + 64, .scan_for_header = true)),
                  "free space past an allocation resolved to it");
-    n00b_require(alloc_info_is(n00b_find_alloc_info((char *)obj + 8,
-                                                    .scan_for_header = true),
-                               hdr),
+    n00b_require(resolves_to((char *)obj + 8, hdr),
                  "an interior address did not resolve to its allocation");
 
     test_obj_t *empty = n00b_alloc_array_with_opts(test_obj_t, 0, ARENA_OPTS(arena));
     n00b_inline_hdr_t *empty_hdr = n00b_option_get(n00b_inline_alloc_header(empty));
-    n00b_require(alloc_info_is(n00b_find_alloc_info(empty, .scan_for_header = true),
-                               empty_hdr),
+    n00b_require(resolves_to(empty, empty_hdr),
                  "a zero-length allocation's pointer did not resolve to it");
 
     // The collector forwards words on a suspended thread's stack, so the
@@ -582,9 +588,7 @@ retain_setup(n00b_arena_t *arena, uint64_t *dead_hdr_hidden, uint64_t *dead_len)
     n00b_require((uintptr_t)hdr == boundary - 256,
                  "the dead object does not start 256 bytes before the page "
                  "boundary");
-    n00b_require(alloc_info_is(n00b_find_alloc_info(dead + 16,
-                                                    .scan_for_header = true),
-                               hdr),
+    n00b_require(resolves_to(dead + 16, hdr),
                  "a pointer into the object did not resolve to it");
 
     *dead_hdr_hidden = HIDE(hdr);

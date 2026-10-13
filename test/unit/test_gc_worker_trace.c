@@ -52,7 +52,11 @@ describe(const char *label, void *p)
         n00b_eprintf("  [|#|]: (null)\n", label);
         return;
     }
-    n00b_alloc_info_t info = n00b_find_alloc_info(p, .scan_for_header = true);
+    bool              pin  = false;
+    n00b_alloc_info_t info = n00b_find_alloc_info(p,
+                                                  .scan_for_header = true,
+                                                  .pin             = &pin);
+    n00b_alloc_hdr_unpin(pin);
     n00b_eprintf("  [|#|]: ptr=[|#:x|] kind=[|#|] "
                  "(inline=[|#|] oob=[|#|] heap=[|#|])\n",
                  label,

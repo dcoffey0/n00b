@@ -245,7 +245,8 @@ unregister_words(uint64_t *words, size_t count)
 static void
 set_ptr_words(void *obj, uint32_t ptr_words)
 {
-    n00b_alloc_info_t info = n00b_find_alloc_info(obj);
+    bool              pin  = false;
+    n00b_alloc_info_t info = n00b_find_alloc_info(obj, .pin = &pin);
 
     if (info.kind == n00b_alloc_oob) {
         info.hdr.oob->ptr_words = ptr_words;
@@ -256,13 +257,14 @@ set_ptr_words(void *obj, uint32_t ptr_words)
             info.hdr.oob->hcur->no_scan   = false;
             info.hdr.oob->hcur->scan_kind = N00B_GC_SCAN_KIND_DEFAULT;
         }
-        return;
     }
-
-    CHECK(info.kind == n00b_alloc_inline);
-    info.hdr.in_line->ptr_words = ptr_words;
-    info.hdr.in_line->no_scan   = false;
-    info.hdr.in_line->scan_kind = N00B_GC_SCAN_KIND_DEFAULT;
+    else {
+        CHECK(info.kind == n00b_alloc_inline);
+        info.hdr.in_line->ptr_words = ptr_words;
+        info.hdr.in_line->no_scan   = false;
+        info.hdr.in_line->scan_kind = N00B_GC_SCAN_KIND_DEFAULT;
+    }
+    n00b_alloc_hdr_unpin(pin);
 }
 
 static void

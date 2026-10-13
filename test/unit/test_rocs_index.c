@@ -890,7 +890,10 @@ test_posting_list_is_precisely_scanned(void)
 
     // The header the GC and the marshaller read from: a callback scan over
     // exactly the two pointer words, never DEFAULT/ALL.
-    n00b_alloc_info_t ai = n00b_find_alloc_info(postings, .scan_for_header = true);
+    bool                pin = false;
+    n00b_alloc_info_t   ai  = n00b_find_alloc_info(postings,
+                                                   .scan_for_header = true,
+                                                   .pin             = &pin);
     n00b_gc_scan_kind_t scan_kind;
     n00b_gc_scan_cb_t   scan_cb;
     void               *scan_user;
@@ -906,6 +909,7 @@ test_posting_list_is_precisely_scanned(void)
         scan_cb   = ai.hdr.oob->scan_cb;
         scan_user = ai.hdr.oob->scan_user;
     }
+    n00b_alloc_hdr_unpin(pin);
     CHECK(scan_kind == N00B_GC_SCAN_KIND_CALLBACK);
     CHECK(scan_cb == n00b_gc_scan_cb_struct_field);
     CHECK(scan_user == (void *)rocs_posting_list_scan_shape());

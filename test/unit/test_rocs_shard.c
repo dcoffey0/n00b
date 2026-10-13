@@ -191,13 +191,17 @@ check_cold_buffer_equal(n00b_store_map_buffer_t *actual,
 static n00b_gc_scan_kind_t
 test_alloc_scan_kind(void *ptr)
 {
-    n00b_alloc_info_t info = n00b_find_alloc_info(ptr, .scan_for_header = true);
+    bool              pin  = false;
+    n00b_alloc_info_t info = n00b_find_alloc_info(ptr,
+                                                  .scan_for_header = true,
+                                                  .pin             = &pin);
 
     CHECK(n00b_alloc_info_is_heap(info));
-    if (n00b_alloc_info_is_oob(info)) {
-        return (n00b_gc_scan_kind_t)info.hdr.oob->scan_kind;
-    }
-    return (n00b_gc_scan_kind_t)info.hdr.in_line->scan_kind;
+    n00b_gc_scan_kind_t kind = n00b_alloc_info_is_oob(info)
+                                 ? (n00b_gc_scan_kind_t)info.hdr.oob->scan_kind
+                                 : (n00b_gc_scan_kind_t)info.hdr.in_line->scan_kind;
+    n00b_alloc_hdr_unpin(pin);
+    return kind;
 }
 
 static n00b_store_posting_list_t *

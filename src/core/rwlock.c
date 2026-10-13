@@ -150,6 +150,20 @@ n00b_rw_adopt_read_hold(n00b_rwlock_t *lock, n00b_thread_t *thread)
     // Read-lock accounting is a no-op in this build regardless (lock_accounting.c).
 }
 
+bool
+n00b_rw_held_by_self(n00b_rwlock_t *lock)
+{
+    n00b_thread_t *thread = n00b_thread_self();
+
+    if (n00b_atomic_load(&lock->data).owner == n00b_thread_os_id(thread)) {
+        return true;
+    }
+    if (thread == nullptr || thread->record == nullptr) {
+        return false;
+    }
+    return find_read_lock_record(lock, thread) != nullptr;
+}
+
 int
 _n00b_rw_write_lock(n00b_rwlock_t *lock, char *loc)
 {
