@@ -177,14 +177,12 @@ n00b_gc_baked_pointer_is_closed(n00b_gc_baked_register_ctx_t *ctx,
         return true;
     }
 
-    auto map_opt = n00b_mmap_by_address(ptr);
-    if (!n00b_option_is_set(map_opt)) {
+    n00b_mmap_view_t map;
+    if (!n00b_mmap_view_by_address(ptr, &map)) {
         return true;
     }
 
-    n00b_mmap_info_t *map = n00b_option_get(map_opt);
-    return map->kind == n00b_mmap_static
-           || map->kind == n00b_mmap_zero_page;
+    return map.kind == n00b_mmap_static || map.kind == n00b_mmap_zero_page;
 }
 
 static bool

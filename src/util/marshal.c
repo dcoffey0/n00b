@@ -2005,9 +2005,9 @@ scan_node(n00b_marshal_ctx_t *ctx, n00b_marshal_node_t *node)
                     rewritten = true;
                 }
                 else {
-                    auto mmap_opt = n00b_mmap_by_address((void *)(uintptr_t)word);
-                    if (n00b_option_is_set(mmap_opt)) {
-                        n00b_mmap_info_t *map = n00b_option_get(mmap_opt);
+                    n00b_mmap_view_t mview;
+                    if (n00b_mmap_view_by_address((void *)(uintptr_t)word, &mview)) {
+                        n00b_mmap_view_t *map = &mview;
                         switch (map->kind) {
                         case n00b_mmap_managed_segment:
                         case n00b_mmap_pool:
@@ -3412,9 +3412,9 @@ unmarshal_relink_records(n00b_unmarshal_ctx_t *ctx)
                 return false;
             }
 
-            auto mmap_opt = n00b_mmap_by_address((void *)(uintptr_t)patch->static_addr);
-            if (!n00b_option_is_set(mmap_opt)
-                || n00b_option_get(mmap_opt)->kind != n00b_mmap_static) {
+            n00b_mmap_view_t view;
+            if (!n00b_mmap_view_by_address((void *)(uintptr_t)patch->static_addr, &view)
+                || view.kind != n00b_mmap_static) {
                 marshal_set_error(&ctx->status,
                                   &ctx->error,
                                   N00B_MARSHAL_ERR_BAD_STREAM,
