@@ -1541,7 +1541,7 @@ n00b_allocator_destroy(n00b_allocator_t *allocator)
 _Atomic(uint64_t) n00b_sentinel_scan_calls = 0;
 _Atomic(uint64_t) n00b_sentinel_scan_words = 0;
 
-static inline void
+[[n00b::nogc]] static inline void
 sentinal_scan_account(uint64_t *from, uint64_t *to)
 {
     atomic_fetch_add_explicit(&n00b_sentinel_scan_calls, 1, memory_order_relaxed);
@@ -1551,16 +1551,18 @@ sentinal_scan_account(uint64_t *from, uint64_t *to)
 }
 
 // The guard memo records, for each N00B_GUARD_MEMO_LINE-aligned address B a
-// backward walk has crossed, the nearest guard word below B. A walk that found
-// none before stopping at its mapping's start S records S | 1 instead, which
-// answers only walks whose own floor is at or above S: a walk resolved against
-// an enclosing mapping must keep looking below S. A later walk stops at the
-// first line boundary that answers it, so each line of the heap is walked once
-// per memo. Lines are kept in one array per page, found through the memo's
-// dict.
+// backward walk has crossed, what lies below B: the nearest guard word, or that
+// no guard lies in [S, B) for the lowest address S the walk examined. Both are
+// facts about memory, so they hold whatever mapping a later walk resolves
+// against. A later walk stops at the first line boundary whose entry answers
+// it, and jumps past a guard-free range that ends above its floor, so each
+// line is walked once per memo. An entry is the distance down to the guard or
+// to S in words, shifted left one bit, with the low bit set for "no guard";
+// zero means unknown, and a distance that does not fit is not recorded. Lines
+// are kept in one array per page, found through the memo's dict.
 #define N00B_GUARD_MEMO_LINE 256
 
-static uint64_t *
+[[n00b::nogc]] static uint32_t *
 guard_memo_lines(n00b_guard_memo_t *memo, uintptr_t page)
 {
     if (memo->last_lines != nullptr && memo->last_page == page) {
@@ -1568,21 +1570,21 @@ guard_memo_lines(n00b_guard_memo_t *memo, uintptr_t page)
     }
 
     bool  found = false;
-    void *lines = n00b_dict_untyped_get(&memo->pages, (void *)page, &found);
+    void *lines = n00b_gc_ptr_table_get(&memo->pages, (void *)page, &found);
 
     if (!found) {
         lines = n00b_alloc_array_with_opts(
-            uint64_t,
+            uint32_t,
             n00b_page_size / N00B_GUARD_MEMO_LINE,
-            &(n00b_alloc_opts_t){.allocator = memo->allocator});
-        n00b_dict_untyped_put(&memo->pages, (void *)page, lines);
+            &(n00b_alloc_opts_t){.allocator = memo->pages.allocator});
+        n00b_gc_ptr_table_put(&memo->pages, (void *)page, lines);
     }
     memo->last_page  = page;
     memo->last_lines = lines;
     return lines;
 }
 
-static char *
+[[n00b::nogc]] static char *
 find_sentinal_memo(uint64_t          *p0,
                    uint64_t          *floor,
                    uint64_t          *start,
@@ -1591,13 +1593,16 @@ find_sentinal_memo(uint64_t          *p0,
     uintptr_t pgmask    = (uintptr_t)n00b_page_size - 1;
     uintptr_t linemask  = N00B_GUARD_MEMO_LINE - 1;
     uintptr_t cur_page  = ~(uintptr_t)0;
-    uint64_t *cur_lines = nullptr;
+    uint32_t *cur_lines = nullptr;
     uint64_t *p         = p0;
-    uint64_t  answer    = 0;
+    uint64_t *guard     = nullptr;
+    uint64_t *clear     = nullptr; // [clear, p0] holds no guard, when set
+    uint64_t  examined  = 0;
 
     while (p >= floor) {
+        examined++;
         if (*p == n00b_gc_guard) {
-            answer = (uint64_t)p;
+            guard = p;
             break;
         }
         if (((uintptr_t)p & linemask) == 0 && p > start) {
@@ -1606,45 +1611,72 @@ find_sentinal_memo(uint64_t          *p0,
                 cur_page  = page;
                 cur_lines = guard_memo_lines(memo, page);
             }
-            uint64_t known = cur_lines[((uintptr_t)p & pgmask) / N00B_GUARD_MEMO_LINE];
-            if (known != 0 && (!(known & 1) || (uint64_t *)(known & ~1ULL) <= floor)) {
-                answer = known;
-                break;
+            uint32_t known = cur_lines[((uintptr_t)p & pgmask) / N00B_GUARD_MEMO_LINE];
+            if (known != 0) {
+                uint64_t *target = p - (known >> 1);
+                if (!(known & 1)) {
+                    guard = target;
+                    break;
+                }
+                if (target <= floor) {
+                    clear = target;
+                    break;
+                }
+                p = target - 1;
+                continue;
             }
         }
         p--;
     }
 
-    // Reaching the mapping's start without a guard is an answer; stopping at
-    // the per-mapping cap is not, since a guard may lie further down.
-    if (answer == 0 && floor == start) {
-        answer = (uint64_t)start | 1;
+    if (guard == nullptr && clear == nullptr) {
+        clear = floor;
     }
 
-    sentinal_scan_account(p0, p);
+    uint64_t *below = guard ? guard : clear;
 
-    if (answer == 0) {
-        return nullptr;
-    }
-
+    // Record the answer at each line the walk crossed or took from the memo,
+    // following the walk's jumps. A guard-free entry the walk jumped through
+    // gets this answer too, so a run of walks with falling floors follows one
+    // entry each rather than every earlier floor. Each line counts as one word
+    // examined.
     for (uintptr_t b = (uintptr_t)p0 & ~linemask;
-         b > (uintptr_t)p && b > (uintptr_t)start;
-         b -= N00B_GUARD_MEMO_LINE) {
+         b > (uintptr_t)below && b > (uintptr_t)start;) {
         uintptr_t page = b & ~pgmask;
         if (page != cur_page) {
             cur_page  = page;
             cur_lines = guard_memo_lines(memo, page);
         }
-        cur_lines[(b & pgmask) / N00B_GUARD_MEMO_LINE] = answer;
+        examined++;
+
+        uint32_t *line  = &cur_lines[(b & pgmask) / N00B_GUARD_MEMO_LINE];
+        uint32_t  known = *line;
+        uintptr_t next  = b - N00B_GUARD_MEMO_LINE;
+
+        if (known != 0) {
+            if (!(known & 1)) {
+                break;
+            }
+            next = (uintptr_t)((uint64_t *)b - (known >> 1) - 1) & ~linemask;
+        }
+
+        uint64_t distance = (uint64_t)((uint64_t *)b - below);
+        if (distance <= UINT32_MAX >> 1) {
+            *line = (uint32_t)(distance << 1) | (guard ? 0u : 1u);
+        }
+        b = next;
     }
 
-    if ((answer & 1) || (uint64_t *)answer < floor) {
+    atomic_fetch_add_explicit(&n00b_sentinel_scan_calls, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&n00b_sentinel_scan_words, examined, memory_order_relaxed);
+
+    if (guard == nullptr || guard < floor) {
         return nullptr;
     }
-    return (char *)answer;
+    return (char *)guard;
 }
 
-static inline char *
+[[n00b::nogc]] static inline char *
 _find_sentinal(uint64_t p_num, n00b_mmap_info_t *map, n00b_guard_memo_t *memo)
 {
     uint64_t *start = (uint64_t *)map->start;

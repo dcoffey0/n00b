@@ -9,8 +9,8 @@
  * mmap registry.
  *
  * The checks are counted work, not time, over one marshal: words the guard
- * scan walked (n00b_sentinel_scan_words) and, in debug builds, registry
- * searches (n00b_mmap_point_searches). Each graph is marshaled at two sizes,
+ * scan walked (n00b_sentinel_scan_words) and registry searches
+ * (n00b_mmap_point_searches). Each graph is marshaled at two sizes,
  * and the work the larger graph adds is bounded per heap word or pointer it
  * adds, which cancels the marshal's fixed costs. Every image is unmarshaled
  * and each pointer checked, so a bound that skipped resolution cannot pass.
@@ -44,12 +44,9 @@
 // inside a node the marshal already holds makes none.
 #define SEARCHES_PER_POINTER 0.05
 
-#if defined(N00B_DEBUG)
+extern _Atomic(bool)     n00b_mmap_count_point_searches;
 extern _Atomic(uint64_t) n00b_mmap_point_searches;
 #define REGISTRY_SEARCHES() atomic_load(&n00b_mmap_point_searches)
-#else
-#define REGISTRY_SEARCHES() UINT64_C(0)
-#endif
 
 typedef enum {
     HEAP_ARENA,
@@ -225,12 +222,10 @@ check_walk(const char *shape, cost_t small, cost_t big)
     pass(msg);
 }
 
-// Registry searches per pointer the larger graph adds. Counted only in debug
-// builds, where n00b_mmap_point_searches exists.
+// Registry searches per pointer the larger graph adds.
 static void
 check_searches(const char *shape, cost_t small, cost_t big, uint64_t added_pointers)
 {
-#if defined(N00B_DEBUG)
     uint64_t added    = big.searches > small.searches ? big.searches - small.searches : 0;
     double   per_word = (double)added / (double)added_pointers;
     char     msg[256];
@@ -251,12 +246,6 @@ check_searches(const char *shape, cost_t small, cost_t big, uint64_t added_point
         return;
     }
     pass(msg);
-#else
-    (void)shape;
-    (void)small;
-    (void)big;
-    (void)added_pointers;
-#endif
 }
 
 int
@@ -264,6 +253,7 @@ main(int argc, char **argv)
 {
     n00b_runtime_t rt;
     n00b_init(&rt, argc, argv);
+    atomic_store(&n00b_mmap_count_point_searches, true);
 
     hidden_pool = calloc(1, sizeof(*hidden_pool));
     n00b_pool_init(hidden_pool,

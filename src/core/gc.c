@@ -1173,6 +1173,12 @@ n00b_gc_stack_set_policy(n00b_gc_stack_policy_t policy)
     return old;
 }
 
+// Stack-map frames pushed, counted while a test sets n00b_gc_count_stack_frames,
+// so a test can bound the frames a path pushes without every push paying for a
+// shared counter.
+_Atomic(bool)     n00b_gc_count_stack_frames  = false;
+_Atomic(uint64_t) n00b_gc_stack_frames_pushed = 0;
+
 // ncc-emitted prologues call this with (void *) arguments (the descriptors are
 // emitted type-name-free as anonymous structs), and the header declares it the
 // same way, so the parameters are void * here and recovered to their concrete
@@ -1180,6 +1186,10 @@ n00b_gc_stack_set_policy(n00b_gc_stack_policy_t policy)
 void
 n00b_gc_stack_push(void *frame_, const void *map_, void **roots)
 {
+    if (atomic_load_explicit(&n00b_gc_count_stack_frames, memory_order_relaxed)) {
+        atomic_fetch_add_explicit(&n00b_gc_stack_frames_pushed, 1, memory_order_relaxed);
+    }
+
     n00b_gc_stack_frame_t           *frame = frame_;
     const n00b_gc_stack_map_t *const map   = map_;
     assert(frame);
@@ -1299,13 +1309,13 @@ n00b_longjmp(n00b_jmp_buf_t *ctx, int value)
 // Helpers
 // ============================================================================
 
-static inline uint32_t
+[[n00b::nogc]] static inline uint32_t
 arena_overhead(n00b_arena_t *arena)
 {
     return arena->vtable.add_inline_header ? N00B_ALLOC_HDR_SZ : 0;
 }
 
-static inline n00b_inline_hdr_t *
+[[n00b::nogc]] static inline n00b_inline_hdr_t *
 alloc_info_raw_hdr(n00b_alloc_info_t info)
 {
     assert(n00b_alloc_info_is_heap(info));
@@ -1644,7 +1654,7 @@ n00b_forward_alloc(n00b_collect_t *ctx, n00b_inline_hdr_t *old)
 
 // Compute the user-data base address from a raw header, using the
 // arena configuration (has_oob) rather than bit-testing.
-static inline char *
+[[n00b::nogc]] static inline char *
 n00b_user_data_base(n00b_inline_hdr_t *hdr, bool has_oob)
 {
     if (has_oob) {
@@ -1653,7 +1663,7 @@ n00b_user_data_base(n00b_inline_hdr_t *hdr, bool has_oob)
     return ((char *)hdr) + sizeof(n00b_inline_hdr_t);
 }
 
-static void *
+[[n00b::nogc]] static void *
 n00b_translate_pointer(n00b_collect_t    *ctx,
                        n00b_inline_hdr_t *old_alloc,
                        uint64_t         **arr,
@@ -1690,12 +1700,82 @@ n00b_translate_pointer(n00b_collect_t    *ctx,
 // Memo operations
 // ============================================================================
 
-static inline bool
+#define N00B_GC_PTR_TABLE_MULT UINT64_C(0x9E3779B97F4A7C15)
+
+void
+n00b_gc_ptr_table_init(n00b_gc_ptr_table_t *t, n00b_allocator_t *allocator, uint32_t log2_capacity)
+{
+    uint64_t cap = UINT64_C(1) << log2_capacity;
+
+    t->keys      = n00b_alloc_array_with_opts(void *, cap, &(n00b_alloc_opts_t){.allocator = allocator});
+    t->values    = n00b_alloc_array_with_opts(void *, cap, &(n00b_alloc_opts_t){.allocator = allocator});
+    t->allocator = allocator;
+    t->count     = 0;
+    t->shift     = 64 - log2_capacity;
+}
+
+// The value recorded for `key`, setting `found` to whether there is one.
+[[n00b::nogc]] void *
+n00b_gc_ptr_table_get(n00b_gc_ptr_table_t *t, void *key, bool *found)
+{
+    uint64_t mask = (UINT64_C(1) << (64 - t->shift)) - 1;
+    uint64_t i    = ((uint64_t)(uintptr_t)key * N00B_GC_PTR_TABLE_MULT) >> t->shift;
+
+    while (t->keys[i] != nullptr) {
+        if (t->keys[i] == key) {
+            *found = true;
+            return t->values[i];
+        }
+        i = (i + 1) & mask;
+    }
+    *found = false;
+    return nullptr;
+}
+
+static void
+n00b_gc_ptr_table_grow(n00b_gc_ptr_table_t *t)
+{
+    n00b_gc_ptr_table_t old = *t;
+    uint64_t            cap = UINT64_C(1) << (64 - old.shift);
+
+    n00b_gc_ptr_table_init(t, old.allocator, 64 - old.shift + 1);
+    for (uint64_t i = 0; i < cap; i++) {
+        if (old.keys[i] != nullptr) {
+            n00b_gc_ptr_table_put(t, old.keys[i], old.values[i]);
+        }
+    }
+    n00b_free_from_allocator(old.allocator, old.keys);
+    n00b_free_from_allocator(old.allocator, old.values);
+}
+
+// Records `value` for `key`, replacing any earlier value. The table stays at
+// most half full.
+[[n00b::nogc]] void
+n00b_gc_ptr_table_put(n00b_gc_ptr_table_t *t, void *key, void *value)
+{
+    if ((t->count + 1) * 2 > (UINT64_C(1) << (64 - t->shift))) {
+        n00b_gc_ptr_table_grow(t);
+    }
+
+    uint64_t mask = (UINT64_C(1) << (64 - t->shift)) - 1;
+    uint64_t i    = ((uint64_t)(uintptr_t)key * N00B_GC_PTR_TABLE_MULT) >> t->shift;
+
+    while (t->keys[i] != nullptr && t->keys[i] != key) {
+        i = (i + 1) & mask;
+    }
+    if (t->keys[i] == nullptr) {
+        t->keys[i] = key;
+        t->count++;
+    }
+    t->values[i] = value;
+}
+
+[[n00b::nogc]] static inline bool
 n00b_is_first_visit(n00b_collect_t *ctx, n00b_inline_hdr_t *h, n00b_inline_hdr_t **fw)
 {
     bool result;
 
-    *fw = n00b_dict_untyped_get(&ctx->memos, h, &result);
+    *fw = n00b_gc_ptr_table_get(&ctx->visited, h, &result);
 
     if (!result) {
         assert(!h->moved);
@@ -1704,10 +1784,10 @@ n00b_is_first_visit(n00b_collect_t *ctx, n00b_inline_hdr_t *h, n00b_inline_hdr_t
     return !result;
 }
 
-static inline void
+[[n00b::nogc]] static inline void
 n00b_register_visit(n00b_collect_t *ctx, n00b_inline_hdr_t *h, n00b_inline_hdr_t *fw)
 {
-    n00b_dict_untyped_add(&ctx->memos, h, fw);
+    n00b_gc_ptr_table_put(&ctx->visited, h, fw);
 }
 
 // ============================================================================
@@ -1805,12 +1885,12 @@ n00b_add_alloc_range_to_worklist(n00b_collect_t *ctx, n00b_alloc_range_t *range)
 {
     bool found = false;
 
-    n00b_dict_untyped_get(&ctx->memos, range, &found);
+    (void)n00b_gc_ptr_table_get(&ctx->visited, range, &found);
     if (found) {
         return false;
     }
 
-    n00b_dict_untyped_add(&ctx->memos, range, range);
+    n00b_gc_ptr_table_put(&ctx->visited, range, range);
     n00b_add_described_scan_range_to_worklist(ctx,
                                               range->start,
                                               range->len / sizeof(void *),
@@ -2197,6 +2277,17 @@ n00b_build_scan_tree(n00b_collect_t *ctx)
     ctx->scan_ceiling = ceiling;
 }
 
+// The allocators the collector writes while it marks: the to-space it copies
+// into, that space's metadata pool, and the collector's own work pool. Guard
+// words in their memory move under a guard memo, so walks there take none.
+[[n00b::nogc]] static inline bool
+n00b_gc_written_during_mark(n00b_collect_t *ctx, n00b_allocator_t *al)
+{
+    return al == (n00b_allocator_t *)ctx->to_space
+        || al == ctx->to_space->vtable.metadata_pool
+        || al == (n00b_allocator_t *)&ctx->work_pool;
+}
+
 [[n00b::nogc]] static inline n00b_scan_owner_t *
 n00b_scan_tree_owner(n00b_collect_t *ctx, uint64_t addr)
 {
@@ -2285,9 +2376,9 @@ n00b_visit_possible_pointer(n00b_collect_t *ctx, uint64_t **base, size_t i, bool
     }
 
     n00b_mmap_info_t  *map  = owner->map;
-    n00b_guard_memo_t *memo = owner->allocator != (n00b_allocator_t *)ctx->to_space
-                                ? &ctx->guard_memo
-                                : nullptr;
+    n00b_guard_memo_t *memo = n00b_gc_written_during_mark(ctx, owner->allocator)
+                                ? nullptr
+                                : &ctx->guard_memo;
 
     auto ainfo = n00b_find_alloc_info_in(word, map, false, nullptr);
 
@@ -3613,7 +3704,7 @@ n00b_finalizers_oob_pass(n00b_collect_t *ctx, bool queue_dead)
         }
 
         bool               found = false;
-        n00b_inline_hdr_t *fw    = n00b_dict_untyped_get(&ctx->memos, oob, &found);
+        n00b_inline_hdr_t *fw    = n00b_gc_ptr_table_get(&ctx->visited, oob, &found);
 
         if (found) {
             n00b_oob_hdr_t *live = (fw == (n00b_inline_hdr_t *)oob)
@@ -3699,7 +3790,7 @@ n00b_finalizers_index_pass(n00b_collect_t *ctx, bool queue_dead)
         }
         n00b_inline_hdr_t *hdr   = alloc_info_raw_hdr(ainfo);
         bool               found = false;
-        n00b_inline_hdr_t *fw    = n00b_dict_untyped_get(&ctx->memos, hdr, &found);
+        n00b_inline_hdr_t *fw    = n00b_gc_ptr_table_get(&ctx->visited, hdr, &found);
 
         if (found) {
             n00b_trace_finalizer_data(ctx, &info->user_ptr);
@@ -3737,7 +3828,7 @@ n00b_finalizers_index_pass(n00b_collect_t *ctx, bool queue_dead)
         n00b_alloc_info_t  ainfo = n00b_find_alloc_info(key);
         n00b_inline_hdr_t *hdr   = alloc_info_raw_hdr(ainfo);
         bool               found = false;
-        n00b_inline_hdr_t *fw    = n00b_dict_untyped_get(&ctx->memos, hdr, &found);
+        n00b_inline_hdr_t *fw    = n00b_gc_ptr_table_get(&ctx->visited, hdr, &found);
         void              *moved = (char *)fw + ((char *)key - (char *)hdr);
 
         info->key = moved;
@@ -3914,21 +4005,9 @@ n00b_collect_setup(n00b_collect_t *ctx, n00b_arena_t *from_space, bool out_of_me
     ctx->worklist = n00b_list_new_cap(n00b_gc_wl_item_t *,
                                       N00B_GC_WL_START_SIZE, .allocator = wa);
 
-    n00b_dict_untyped_init(&ctx->memos,
-                           .start_capacity = N00B_GC_WL_START_SIZE,
-                           .allocator      = wa,
-                           .hash           = n00b_hash_word,
-                           .skip_obj_hash  = true,
-                           .scan_kind      = N00B_GC_SCAN_KIND_NONE);
-
-    n00b_dict_untyped_init(&ctx->guard_memo.pages,
-                           .start_capacity = N00B_GC_WL_START_SIZE,
-                           .allocator      = wa,
-                           .hash           = n00b_hash_word,
-                           .skip_obj_hash  = true,
-                           .scan_kind      = N00B_GC_SCAN_KIND_NONE);
     // clang-format on
-    ctx->guard_memo.allocator  = wa;
+    n00b_gc_ptr_table_init(&ctx->visited, wa, 8);
+    n00b_gc_ptr_table_init(&ctx->guard_memo.pages, wa, 6);
     ctx->guard_memo.last_page  = 0;
     ctx->guard_memo.last_lines = nullptr;
 

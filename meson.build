@@ -4406,6 +4406,10 @@ test('lint_interior_resolution', python3,
     args: [files('scripts/lint_interior_resolution.py'), meson.project_source_root()],
     suite: 'lint',
 )
+test('lint_interior_resolution_self_test', python3,
+    args: [files('scripts/lint_interior_resolution.py'), '--self-test'],
+    suite: 'lint',
+)
 
 std_streams_test = executable('test_std_streams',
     ['test/unit/test_std_streams.c'],

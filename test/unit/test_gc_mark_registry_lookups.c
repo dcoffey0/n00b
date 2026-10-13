@@ -7,8 +7,8 @@
  * global mmap tree again for the same answer: a search visits about 26
  * registry nodes on a heap of a few thousand segments.
  *
- * The check counts registry point searches (n00b_mmap_point_searches, a
- * debug-build counter) over one collection, at two heap sizes, and bounds the
+ * The check counts registry point searches (n00b_mmap_point_searches, which
+ * counts while n00b_mmap_count_point_searches is set) over one collection, at two heap sizes, and bounds the
  * searches the larger heap adds per pointer word it adds. Half the words point
  * at another object's base and half into their own object, so both the direct
  * and the interior resolution are covered.
@@ -31,7 +31,7 @@
 #include "core/runtime.h"
 #include "core/stw.h"
 
-#if defined(N00B_DEBUG)
+extern _Atomic(bool)     n00b_mmap_count_point_searches;
 extern _Atomic(uint64_t) n00b_mmap_point_searches;
 
 #define N_OBJECTS 256
@@ -45,11 +45,25 @@ extern _Atomic uint64_t n00b_gc_last_segment_lookups;
 // Segment-tree descents a collection may make per added object.
 #define LOOKUPS_PER_OBJECT 0.05
 
+// Stack-map frames a mark may push per added pointer word. Resolving a word
+// through the collector's own tables pushes none, and any framed call made
+// once per word pushes at least one; what remains is per pool page (scan-tree
+// nodes, memo line arrays), which a larger heap of the same objects adds too.
+#define FRAMES_PER_WORD 0.5
+
+extern _Atomic(bool)     n00b_gc_count_stack_frames;
+extern _Atomic(uint64_t) n00b_gc_stack_frames_pushed;
+
 static void ***g_objs;
+
+typedef struct {
+    uint64_t searches; // registry point searches during the collection
+    uint64_t frames;   // stack-map frames pushed during the collection
+} cost_t;
 
 // A pool row builds its heap in user_pool and collects an empty arena, which
 // traces through the pool; an arena row collects the arena holding the heap.
-static uint64_t
+static cost_t
 run(bool pool, uint64_t words)
 {
     n00b_arena_t *arena = n00b_new_arena(.size = (pool ? 0 : N_OBJECTS * words * 8 * 4)
@@ -72,13 +86,24 @@ run(bool pool, uint64_t words)
         }
     }
 
+    // A first collection settles the rest of the process (earlier rows'
+    // garbage, first-time setup), so the measured one differs between sizes
+    // only by the heap under test.
+    n00b_stop_the_world();
+    n00b_collect(arena);
+    n00b_restart_the_world();
+
     uint64_t before = atomic_load(&n00b_mmap_point_searches);
+    uint64_t frames = atomic_load(&n00b_gc_stack_frames_pushed);
 
     n00b_stop_the_world();
     n00b_collect(arena);
     n00b_restart_the_world();
 
-    uint64_t searches = atomic_load(&n00b_mmap_point_searches) - before;
+    cost_t c = {
+        .searches = atomic_load(&n00b_mmap_point_searches) - before,
+        .frames   = atomic_load(&n00b_gc_stack_frames_pushed) - frames,
+    };
 
     for (uint64_t i = 0; i < N_OBJECTS; i++) {
         void **obj  = g_objs[i];
@@ -90,7 +115,21 @@ run(bool pool, uint64_t words)
     }
 
     g_objs = nullptr;
-    return searches;
+    return c;
+}
+
+// The cheaper of two runs, field by field: a collection's fixed cost spikes the
+// first time a heap is traced, and the bounds are on what each size adds.
+static cost_t
+run_min(bool pool, uint64_t words)
+{
+    cost_t a = run(pool, words);
+    cost_t b = run(pool, words);
+
+    return (cost_t){
+        .searches = a.searches < b.searches ? a.searches : b.searches,
+        .frames   = a.frames < b.frames ? a.frames : b.frames,
+    };
 }
 
 // Segment lookups one collection makes over `n` four-word objects in a chain.
@@ -126,6 +165,8 @@ main(int argc, char **argv)
 {
     n00b_runtime_t rt;
     n00b_init(&rt, argc, argv);
+    atomic_store(&n00b_mmap_count_point_searches, true);
+    atomic_store(&n00b_gc_count_stack_frames, true);
 
     printf("n00b#539: registry searches per pointer word in the mark (pin-all: %s)\n",
            n00b_gc_pin_all_policy() ? "on" : "off");
@@ -137,8 +178,10 @@ main(int argc, char **argv)
 
     for (int pool = 0; pool <= 1; pool++) {
         const char *heap     = pool ? "user_pool" : "gc arena";
-        uint64_t    small    = run(pool, small_words);
-        uint64_t    big      = run(pool, big_words);
+        cost_t      c_small  = run_min(pool, small_words);
+        cost_t      c_big    = run_min(pool, big_words);
+        uint64_t    small    = c_small.searches;
+        uint64_t    big      = c_big.searches;
         double      per_word = big > small ? (double)(big - small) / (double)added_words
                                            : 0.0;
 
@@ -159,6 +202,29 @@ main(int argc, char **argv)
                heap,
                SEARCHES_PER_WORD);
         failed |= over;
+
+        double frames = c_big.frames > c_small.frames
+                          ? (double)(c_big.frames - c_small.frames) / (double)added_words
+                          : 0.0;
+
+        printf("  ... %s: %llu stack-map frames, then %llu: %.3f per added word\n",
+               heap,
+               (unsigned long long)c_small.frames,
+               (unsigned long long)c_big.frames,
+               frames);
+
+        // A debug build's arenas resolve each word through their out-of-band
+        // metadata dict as well, which pushes frames of its own.
+        if (pool) {
+            bool over_frames = frames > FRAMES_PER_WORD;
+
+            printf("  [%s] %s: the mark resolves pointer words without a"
+                   " general-purpose dict call (bound %.2f frames per word)\n",
+                   over_frames ? "FAIL" : "PASS",
+                   heap,
+                   FRAMES_PER_WORD);
+            failed |= over_frames;
+        }
     }
 
     uint64_t few      = segment_lookups(4096);
@@ -180,11 +246,3 @@ main(int argc, char **argv)
     n00b_shutdown();
     return failed;
 }
-#else
-int
-main(void)
-{
-    printf("  [SKIP] n00b_mmap_point_searches is counted only in debug builds\n");
-    return 0;
-}
-#endif

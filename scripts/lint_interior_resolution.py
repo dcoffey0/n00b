@@ -10,11 +10,14 @@ collector's mark and in the marshal.
 
 The per-word paths share work across resolutions (the mark's guard memo, the
 marshal's node index). Every other caller resolves one pointer per operation.
-This lint counts calls to both functions, and fails when a file gains or loses
-one, so a new caller has to be listed below with the reason its cost is
-bounded.
+This lint counts the calls that can walk: n00b_find_alloc_info with
+.scan_for_header set to anything but a literal false, and
+n00b_find_alloc_info_in with a third argument other than a literal false. It
+fails when a file gains or loses one, so a new caller has to be listed below
+with the reason its cost is bounded.
 
 Usage: lint_interior_resolution.py <source root>
+       lint_interior_resolution.py --self-test
 """
 import os
 import re
@@ -30,18 +33,46 @@ SKIP_DIRS = ("src/vendor",)
 ALLOWED = {
     "src/core/alloc.c": (1, "defines n00b_find_alloc_info_in"),
     "src/core/alloc_interpose.c": (3, "one resolution per libc call"),
-    "src/core/gc.c": (3, "the mark's direct lookup and its memoized walk; the "
-                         "register pin pre-pass runs once per captured register"),
+    "src/core/gc.c": (2, "the mark's walk shares the guard memo; the register "
+                         "pin pre-pass runs once per captured register"),
     "src/rocs/index.c": (1, "sets the scan kind of one allocation"),
     "src/rocs/shard.c": (3, "sets the scan kind of one allocation"),
     "src/util/marshal.c": (2, "the node index leaves the first pointers into "
                               "each object, plus the root"),
 }
 
-SITE = re.compile(
-    r"\.scan_for_header\s*=\s*true"
-    r"|\bn00b_find_alloc_info_in\s*\("
-)
+SCAN_FOR_HEADER = re.compile(r"\.scan_for_header\s*=\s*(?!false\b)\S")
+FIND_IN = re.compile(r"\bn00b_find_alloc_info_in\s*\(")
+
+
+def call_args(text: str, open_paren: int) -> list[str]:
+    """The top-level, comma-separated arguments of the call whose opening
+    parenthesis is at `open_paren`."""
+    args, depth, cur = [], 0, []
+    for c in text[open_paren + 1:]:
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            if depth == 0:
+                args.append("".join(cur).strip())
+                return args
+            depth -= 1
+        elif c == "," and depth == 0:
+            args.append("".join(cur).strip())
+            cur = []
+            continue
+        cur.append(c)
+    return args
+
+
+def walk_sites(text: str) -> list[int]:
+    """Offsets of the calls in `text` that can run the backward guard walk."""
+    sites = [m.start() for m in SCAN_FOR_HEADER.finditer(text)]
+    for m in FIND_IN.finditer(text):
+        args = call_args(text, m.end() - 1)
+        if len(args) < 3 or args[2] != "false":
+            sites.append(m.start())
+    return sorted(sites)
 
 
 def scan(root: str) -> list[str]:
@@ -61,8 +92,7 @@ def scan(root: str) -> list[str]:
                 rel = f"{rel_dir}/{name}"
                 with open(path, encoding="utf-8", errors="replace") as f:
                     text = strip_comments_and_literals(f.read())
-                lines = [text.count("\n", 0, m.start()) + 1
-                         for m in SITE.finditer(text)]
+                lines = [text.count("\n", 0, at) + 1 for at in walk_sites(text)]
                 # A declaration in a header is not a call.
                 if rel.startswith("include/"):
                     continue
@@ -83,7 +113,30 @@ def scan(root: str) -> list[str]:
     return problems
 
 
+SELF_TEST = [
+    ("a literal true walks", "f(n00b_find_alloc_info(p, .scan_for_header = true));", 1),
+    ("a variable may walk", "f(n00b_find_alloc_info(p, .scan_for_header = walk));", 1),
+    ("a literal false does not", "f(n00b_find_alloc_info(p, .scan_for_header = false));", 0),
+    ("_in with false does not", "n00b_find_alloc_info_in(w, map, false, nullptr);", 0),
+    ("_in with true walks", "n00b_find_alloc_info_in(w, map, true, memo);", 1),
+    ("_in with a variable may walk", "n00b_find_alloc_info_in(w, f(a, b), hdr, memo);", 1),
+    ("comments do not count", "// n00b_find_alloc_info(p, .scan_for_header = true)", 0),
+]
+
+
+def self_test() -> int:
+    failures = 0
+    for name, src, want in SELF_TEST:
+        got = len(walk_sites(strip_comments_and_literals(src)))
+        ok = got == want
+        failures += not ok
+        print(f"  [{'PASS' if ok else 'FAIL'}] self-test {name}: {got} site(s), want {want}")
+    return 1 if failures else 0
+
+
 def main() -> int:
+    if sys.argv[1:] == ["--self-test"]:
+        return self_test()
     if len(sys.argv) != 2:
         print(__doc__.strip().splitlines()[-1], file=sys.stderr)
         return 2
