@@ -124,6 +124,14 @@ struct n00b_thread_record_t {
      * additional stack pages. */
     _Atomic(void *) stack_lo;
     _Atomic(void *) stack_hi;
+#ifdef N00B_DEBUG
+    // Owner-thread-only counts of this thread's rwlock read and write
+    // acquisitions and of its write releases, each of which makes a futex
+    // wake.
+    uint64_t debug_rw_read_acquires;
+    uint64_t debug_rw_write_acquires;
+    uint64_t debug_rw_write_wakes;
+#endif
 };
 
 #ifdef _WIN32

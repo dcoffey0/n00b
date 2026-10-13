@@ -4114,6 +4114,18 @@ dense_postings_test = executable('test_rocs_dense_postings',
 )
 test('rocs_dense_postings', dense_postings_test, suite: 'unit')
 
+posting_writes_test = executable('test_rocs_posting_writes',
+    ['test/unit/test_rocs_posting_writes.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_posting_writes', posting_writes_test, suite: 'unit')
+
+ingest_locks_test = executable('test_rocs_ingest_locks',
+    ['test/unit/test_rocs_ingest_locks.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_ingest_locks', ingest_locks_test, suite: 'unit')
+
 condition_test = executable('test_condition',
     ['test/unit/test_condition.c'],
     kwargs: test_common_kwargs,

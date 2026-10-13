@@ -346,12 +346,11 @@ rocs_hot_shard_record_stored(n00b_store_shard_t *shard, uint64_t ordinal)
         return n00b_result_err(n00b_string_t *, N00B_STORE_INDEX_ERR_ARG);
     }
 
-    uint64_t len = (uint64_t)n00b_list_len(*shard->records);
-    if (ordinal >= len) {
+    if (ordinal >= n00b_store_shard_records_len(shard)) {
         return n00b_result_err(n00b_string_t *, N00B_STORE_INDEX_ERR_STATE);
     }
 
-    n00b_string_t *text = n00b_list_get(*shard->records, (size_t)ordinal);
+    n00b_string_t *text = n00b_store_shard_record_at(shard, ordinal);
     if (text == nullptr || (text->u8_bytes != 0 && text->data == nullptr)) {
         return n00b_result_err(n00b_string_t *, N00B_STORE_INDEX_ERR_STATE);
     }
@@ -619,7 +618,7 @@ rocs_posting_list_apply_scan(n00b_store_posting_list_t *postings)
     }
 }
 
-static n00b_store_posting_list_t *
+n00b_store_posting_list_t *
 rocs_posting_list_new() _kargs
 {
     n00b_store_postings_kind_t kind      = N00B_STORE_POSTINGS_SPARSE;
@@ -645,26 +644,14 @@ rocs_posting_list_new() _kargs
     postings->ordinals = nullptr;
     postings->flags    = nullptr;
 
+    // No lock on either representation. Each shard's posting lists have one
+    // writer at a time (store ingest holds commit_lock; n00b_store_index_add
+    // callers must not overlap on a shard), and readers pin the shard and read
+    // lock-free below the store's published bound: see rocs_posting_list_push.
     if (postings->kind == N00B_STORE_POSTINGS_DENSE) {
-        // Locked. Setting a bit is a read-modify-write of the 64-bit word it
-        // sits in, so two writers on ordinals 8 apart are writing the same
-        // location and one of them loses the other's bit. Growing the bitmap
-        // is worse: it allocates, copies and frees, under readers holding the
-        // old pointer. Neither is hypothetical: two threads indexing one
-        // dense field drop records outright, and crash more often than not.
-        //
-        // Same allocator as the set it guards, which n00b_flagset_init
-        // arranges, so the lock has the lifetime and non-moving properties the
-        // ordinals lock below is chosen for.
         postings->flags = n00b_flagset_new(.length    = 64,
-                                           .locked    = true,
+                                           .locked    = false,
                                            .allocator = allocator);
-        n00b_lock_set_debug_name(postings->flags->lock,
-                                 "rocs dense postings");
-        // Inside a posting list, so it ranks below one. A list is sparse or
-        // dense and never both, so the two are not nested; ranking it costs
-        // nothing and means a future nesting is reported rather than found.
-        n00b_lock_set_rank(postings->flags->lock, N00B_LOCK_RANK_FLAGSET);
     }
     else {
         postings->ordinals = n00b_alloc_with_opts(
@@ -676,21 +663,6 @@ rocs_posting_list_new() _kargs
             uint64_t,
             .allocator = allocator,
             .scan_kind = N00B_GC_SCAN_KIND_NONE);
-        // Same allocator as the list it guards. A store's hot pool is
-        // non-moving and freed wholesale at seal or retire, so the lock
-        // neither relocates under a futex waiter nor outlives the shard.
-        // Callers without a store pass a pool with the same properties; the
-        // default moving heap would relocate it.
-        //
-        // The runtime system pool would also never move, but never frees
-        // either: one rwlock per distinct term per field per shard. Pinning
-        // individual allocations would drop the constraint altogether, but
-        // that GC work is designed and unbuilt
-        // (doc/gc-mostly-copying-pinning.md).
-        postings->ordinals->lock = n00b_data_lock_new(.allocator = allocator);
-        n00b_lock_set_debug_name(postings->ordinals->lock,
-                                 "rocs posting ordinals");
-        n00b_lock_set_rank(postings->ordinals->lock, N00B_LOCK_RANK_POSTINGS);
     }
     return postings;
 }
@@ -851,15 +823,88 @@ rocs_column_bucket_hash(n00b_uint128_t key)
     return n00b_hash_raw(&key, sizeof(key));
 }
 
+#ifdef N00B_DEBUG
+// Debug-only claim on a hot shard's posting lists and record list, kept in the
+// shard root's reserved word, which is zero whenever no write is in flight and
+// so reaches a sealed image as the zero the mapped reader requires.
+void
+rocs_index_writer_enter(n00b_store_shard_t *shard)
+{
+    if (shard == nullptr) {
+        return;
+    }
+    uint32_t idle = 0;
+    n00b_require(__atomic_compare_exchange_n(&shard->reserved,
+                                             &idle,
+                                             1u,
+                                             false,
+                                             __ATOMIC_ACQUIRE,
+                                             __ATOMIC_RELAXED),
+                 "two threads are writing one hot shard");
+}
+
+void
+rocs_index_writer_exit(n00b_store_shard_t *shard)
+{
+    if (shard == nullptr) {
+        return;
+    }
+    __atomic_store_n(&shard->reserved, 0u, __ATOMIC_RELEASE);
+}
+
+static _Atomic(rocs_posting_read_hook_t) rocs_posting_read_hook     = nullptr;
+static void *_Atomic                     rocs_posting_read_hook_ctx = nullptr;
+
+void
+rocs_posting_read_hook_set(rocs_posting_read_hook_t hook, void *ctx)
+{
+    atomic_store(&rocs_posting_read_hook_ctx, ctx);
+    atomic_store(&rocs_posting_read_hook, hook);
+}
+
+static void
+rocs_posting_read_point(n00b_store_posting_list_t *postings)
+{
+    rocs_posting_read_hook_t hook = atomic_load(&rocs_posting_read_hook);
+    if (hook != nullptr) {
+        hook(postings, atomic_load(&rocs_posting_read_hook_ctx));
+    }
+}
+#else
+#define rocs_posting_read_point(postings) ((void)(postings))
+#endif
+
+// A consistent prefix of a sparse list, for a reader that holds no lock.
+//
+// The length is acquired before the array: the writer publishes a grown array
+// before any length that needs it, so the array loaded second holds at least
+// that many elements. The order bit is read last, because the writer clears it
+// before publishing the length that exposes an out-of-order element.
+static const uint64_t *
+rocs_posting_sparse_view(n00b_store_posting_list_t *postings,
+                         size_t                    *len_out,
+                         bool                      *ordered_out)
+{
+    n00b_store_posting_ordinal_list_t *list = postings->ordinals;
+    size_t          len  = __atomic_load_n(&list->len, __ATOMIC_ACQUIRE);
+    const uint64_t *data = __atomic_load_n(&list->data, __ATOMIC_ACQUIRE);
+
+    *len_out     = len;
+    *ordered_out = (n00b_atomic_load(&postings->reserved)
+                    & N00B_STORE_POSTINGS_ORDERED)
+                != 0;
+    rocs_posting_read_point(postings);
+    return data;
+}
+
 // Put a sparse list in ascending order, and drop repeats.
 //
-// For the list's owner only: sealing, or a caller ordering a list it just
-// built. A reader must not call this. It takes the write lock and renumbers
-// the list, so a reader that called it would be mutating shared state to
-// answer a question, and would shift the elements under any other reader
-// walking the same list positionally. Readers that want order either take a
-// private copy and sort that (rocs_posting_snapshot_ordinals) or consult
-// N00B_STORE_POSTINGS_ORDERED and scan when it is clear.
+// Only the shard's sealer calls this, after the store has drained every hot
+// reader, so it sorts in place with nothing to exclude. A reader must not: it
+// would renumber the list under any other reader walking it. Readers that want
+// order either take a private copy and sort that
+// (rocs_posting_snapshot_ordinals) or consult N00B_STORE_POSTINGS_ORDERED and
+// scan when it is clear.
 //
 // Pushes append, so a list stays ascending until an ordinal arrives below the
 // tail. Ordering here rather than placing on arrival is what keeps indexing n
@@ -878,35 +923,22 @@ rocs_posting_list_ensure_ordered(n00b_store_posting_list_t *postings)
         return;
     }
 
-    _n00b_list_write_lock(postings->ordinals);
+    size_t len = postings->ordinals->len;
+    if (len > 1) {
+        qsort(postings->ordinals->data, len, sizeof(uint64_t),
+              rocs_u64_compare);
 
-    // Re-checked under the lock: another writer may have sorted it between the
-    // test above and here.
-    if ((n00b_atomic_load(&postings->reserved) & N00B_STORE_POSTINGS_ORDERED) == 0) {
-        size_t len = postings->ordinals->len;
-        if (len > 1) {
-            // Sorted through the raw array rather than n00b_list_sort: the
-            // write lock is already held here, and the list API takes it.
-            qsort(postings->ordinals->data, len, sizeof(uint64_t),
-                  rocs_u64_compare);
-
-            size_t out = 1;
-            for (size_t i = 1; i < len; i++) {
-                if (postings->ordinals->data[i]
-                    != postings->ordinals->data[out - 1]) {
-                    postings->ordinals->data[out++]
-                        = postings->ordinals->data[i];
-                }
+        size_t out = 1;
+        for (size_t i = 1; i < len; i++) {
+            if (postings->ordinals->data[i]
+                != postings->ordinals->data[out - 1]) {
+                postings->ordinals->data[out++] = postings->ordinals->data[i];
             }
-            postings->ordinals->len = out;
-            n00b_atomic_store(&postings->count, (uint64_t)out);
         }
-        n00b_atomic_store(&postings->reserved,
-                          n00b_atomic_load(&postings->reserved)
-                              | N00B_STORE_POSTINGS_ORDERED);
+        postings->ordinals->len = out;
+        n00b_atomic_store(&postings->count, (uint64_t)out);
     }
-
-    _n00b_list_unlock(postings->ordinals);
+    n00b_atomic_or(&postings->reserved, N00B_STORE_POSTINGS_ORDERED);
 }
 
 static bool
@@ -918,7 +950,18 @@ rocs_posting_list_contains_ordinal(n00b_store_posting_list_t *postings,
     }
 
     if (postings->kind == N00B_STORE_POSTINGS_DENSE) {
-        return n00b_flagset_index(postings->flags, (int64_t)ordinal);
+        if (postings->flags == nullptr) {
+            return false;
+        }
+        const uint64_t *words   = nullptr;
+        uint64_t        wordlen = 0;
+        n00b_flagset_view(postings->flags, &words, &wordlen);
+        rocs_posting_read_point(postings);
+        if ((ordinal >> 6) >= wordlen) {
+            return false;
+        }
+        uint64_t word = __atomic_load_n(&words[ordinal >> 6], __ATOMIC_RELAXED);
+        return (word & (1ull << (ordinal & 63u))) != 0;
     }
 
     if (postings->ordinals == nullptr) {
@@ -928,43 +971,31 @@ rocs_posting_list_contains_ordinal(n00b_store_posting_list_t *postings,
     // Note this is not the push path's tail check, which is a dedup predicate
     // and answers membership only for the ordinal being appended.
     //
-    // One lock for the whole search, not one per step. A search that took the
-    // lock per access would see each element intact and still answer wrongly:
-    // an insert below the tail shifts everything above it, so the halves this
-    // has already ruled out stop describing the list it is still searching,
-    // and an ordinal that is present reads as absent. Held across the search,
-    // the list cannot move under it. The push side holds the write lock over
-    // the same span for the same reason.
-    _n00b_list_read_lock(postings->ordinals);
+    // The prefix below the loaded length never moves while the shard is hot:
+    // pushes only append past it, and the one in-place sort runs at seal. So a
+    // binary search over it sees the list it started on.
+    size_t          len     = 0;
+    bool            ordered = false;
+    const uint64_t *data    = rocs_posting_sparse_view(postings, &len, &ordered);
 
-    // The order bit is read under the same lock as the data it describes.
-    // Push clears it while holding the write lock, so a reader cannot see the
-    // bit set and an out-of-order element already appended past it, which is
-    // a binary search over data that stopped being sorted underneath it.
     // An unordered list is scanned, which is right regardless and is what the
     // sealed reader does with the same bit clear.
-    if ((n00b_atomic_load(&postings->reserved) & N00B_STORE_POSTINGS_ORDERED) == 0) {
-        bool   hit = false;
-        size_t len = postings->ordinals->len;
+    if (!ordered) {
         for (size_t i = 0; i < len; i++) {
-            if (postings->ordinals->data[i] == ordinal) {
-                hit = true;
-                break;
+            if (data[i] == ordinal) {
+                return true;
             }
         }
-        _n00b_list_unlock(postings->ordinals);
-        return hit;
+        return false;
     }
 
-    uint64_t lo    = 0;
-    uint64_t hi    = (uint64_t)postings->ordinals->len;
-    bool     found = false;
+    uint64_t lo = 0;
+    uint64_t hi = (uint64_t)len;
     while (lo < hi) {
         uint64_t mid   = lo + (hi - lo) / 2;
-        uint64_t value = postings->ordinals->data[mid];
+        uint64_t value = data[mid];
         if (value == ordinal) {
-            found = true;
-            break;
+            return true;
         }
         if (value < ordinal) {
             lo = mid + 1;
@@ -973,25 +1004,17 @@ rocs_posting_list_contains_ordinal(n00b_store_posting_list_t *postings,
             hi = mid;
         }
     }
-    _n00b_list_unlock(postings->ordinals);
-    return found;
+    return false;
 }
 
-// A private copy of a sparse list's ordinals, taken under one lock.
+// A private copy of a sparse list's ordinals, ascending.
 //
-// Walking the live list by index takes the lock per element, so the list can
-// change between two of them: pushes append, and a sort in place renumbers
-// (rocs_posting_list_ensure_ordered). A walk that sampled the length and then
-// read elements one at a time could see an element twice and never see
-// another, which drops a record from the answer. One copy under one lock
-// cannot straddle either mutation.
-//
-// A copy rather than holding the lock across the walk: callers do work per
-// element that takes another posting list's lock, and holding both would let
-// two queries pairing the same lists in opposite orders deadlock.
+// A copy rather than a walk of the live list: callers do work per element, and
+// a copy lets them sort without touching the shared list. The prefix copied
+// is fixed once its length is loaded (see rocs_posting_sparse_view).
 //
 // Dense lists are returned as null; rocs_posting_list_collect walks their
-// bitmap under the set's own lock instead.
+// bitmap instead.
 static uint64_t *
 rocs_posting_snapshot_ordinals(n00b_store_posting_list_t *postings,
                                uint64_t                  *len_out,
@@ -1003,41 +1026,36 @@ rocs_posting_snapshot_ordinals(n00b_store_posting_list_t *postings,
         return nullptr;
     }
 
-    _n00b_list_read_lock(postings->ordinals);
-    uint64_t  len     = (uint64_t)postings->ordinals->len;
-    bool      ordered = (n00b_atomic_load(&postings->reserved)
-                         & N00B_STORE_POSTINGS_ORDERED)
-                     != 0;
-    uint64_t *copy    = nullptr;
+    size_t          len     = 0;
+    bool            ordered = false;
+    const uint64_t *data    = rocs_posting_sparse_view(postings, &len, &ordered);
+    uint64_t       *copy    = nullptr;
     if (len != 0) {
         copy = n00b_alloc_array_with_opts(
             uint64_t,
-            (size_t)len,
+            len,
             &(n00b_alloc_opts_t){.allocator = allocator,
                                  .scan_kind = N00B_GC_SCAN_KIND_NONE});
-        memcpy(copy, postings->ordinals->data, (size_t)len * sizeof(uint64_t));
+        memcpy(copy, data, len * sizeof(uint64_t));
     }
-    _n00b_list_unlock(postings->ordinals);
 
     // Callers walk this ascending. Sorted here, on the private copy, rather
-    // than by ordering the shared list: a reader that sorted what it was
-    // reading would be taking a write lock to answer a question, and would
-    // renumber the list under any other reader walking it positionally.
+    // than by ordering the shared list, which only the sealer may renumber.
     if (!ordered && len > 1) {
-        qsort(copy, (size_t)len, sizeof(uint64_t), rocs_u64_compare);
+        qsort(copy, len, sizeof(uint64_t), rocs_u64_compare);
     }
 
-    *len_out = len;
+    *len_out = (uint64_t)len;
     return copy;
 }
 
 // Every ordinal of a hot list, ascending and unique, in one private array.
 //
-// A sparse list is copied under its lock (rocs_posting_snapshot_ordinals). A
-// dense one is read under its read lock: one popcount pass sizes the output,
-// and one walk fills it, so p postings in a bitmap of w words cost 2w + p.
-// Sizing from the bits keeps the answer independent of the list's separate
-// count. The lock makes both passes see one set.
+// A sparse list is copied (rocs_posting_snapshot_ordinals). A dense one has
+// its words copied first, because the writer may set bits while this runs and
+// the two passes below must agree: one popcount pass sizes the output, and
+// one walk fills it, so p postings in a bitmap of w words cost 2w + p. Sizing
+// from the bits keeps the answer independent of the list's separate count.
 static uint64_t *
 rocs_posting_list_collect(n00b_store_posting_list_t *postings,
                           uint64_t                  *len_out,
@@ -1065,26 +1083,35 @@ rocs_posting_list_collect(n00b_store_posting_list_t *postings,
         return nullptr;
     }
 
-    n00b_data_read_lock(flags->lock);
-    uint64_t count = 0;
-    for (uint64_t word_ix = 0; word_ix < flags->alloc_wordlen; word_ix++) {
-        count += (uint64_t)__builtin_popcountll(flags->contents[word_ix]);
+    const uint64_t *live    = nullptr;
+    uint64_t        wordlen = 0;
+    n00b_flagset_view(flags, &live, &wordlen);
+    rocs_posting_read_point(postings);
+    if (wordlen == 0) {
+        ROCS_POSTING_STEPS(0);
+        return nullptr;
     }
-    ROCS_POSTING_STEPS(flags->alloc_wordlen);
+
+    uint64_t *words = rocs_ordinals_alloc(wordlen, allocator);
+    uint64_t  count = 0;
+    for (uint64_t word_ix = 0; word_ix < wordlen; word_ix++) {
+        words[word_ix] = __atomic_load_n(&live[word_ix], __ATOMIC_RELAXED);
+        count += (uint64_t)__builtin_popcountll(words[word_ix]);
+    }
+    ROCS_POSTING_STEPS(wordlen);
 
     uint64_t *out     = rocs_ordinals_alloc(count, allocator);
     uint64_t  written = 0;
-    for (uint64_t word_ix = 0; word_ix < flags->alloc_wordlen
-                               && written < count;
+    for (uint64_t word_ix = 0; word_ix < wordlen && written < count;
          word_ix++) {
-        uint64_t word = flags->contents[word_ix];
-        while (word != 0 && written < count) {
+        uint64_t word = words[word_ix];
+        while (word != 0) {
             out[written++] = (word_ix << 6) + (uint64_t)__builtin_ctzll(word);
             word &= word - 1;
         }
         ROCS_POSTING_STEPS(1);
     }
-    n00b_data_unlock(flags->lock);
+    n00b_free(words);
 
     ROCS_POSTING_STEPS(written);
     *len_out = written;
@@ -1703,7 +1730,7 @@ rocs_index_lookup_catch_all_terms(n00b_store_index_t            *index,
     uint64_t *ordinals = rocs_ordinals_union(parts, lens, found, &len, allocator);
     return rocs_postings_from_ordinals(ordinals,
                                        len,
-                                       (uint64_t)n00b_list_len(*shard->records),
+                                       n00b_store_shard_records_len(shard),
                                        shard,
                                        nullptr,
                                        shard_id,
@@ -1824,6 +1851,28 @@ rocs_index_unique_postings(n00b_store_index_kind_t kind)
         || kind == N00B_STORE_INDEX_NGRAM;
 }
 
+// Grow a sparse list for its one writer. The copy is published before any
+// length that reaches past the old array, and the old array is left where it
+// is: a reader that loaded it may still be copying out of it, and freeing it
+// into the shard's pool would hand those words to the next allocation, which
+// zeroes and reuses them. It goes back with the pool when the shard retires.
+static void
+rocs_posting_ordinals_grow(n00b_store_posting_ordinal_list_t *list,
+                           size_t                             need)
+{
+    size_t    cap   = n00b_align_closest_pow2_ceil(n00b_max(need, list->cap * 2));
+    uint64_t *grown = n00b_alloc_array_with_opts(
+        uint64_t,
+        cap,
+        &(n00b_alloc_opts_t){.allocator = list->allocator,
+                             .scan_kind = N00B_GC_SCAN_KIND_NONE});
+    if (list->len != 0) {
+        memcpy(grown, list->data, list->len * sizeof(uint64_t));
+    }
+    __atomic_store_n(&list->data, grown, __ATOMIC_RELEASE);
+    list->cap = cap;
+}
+
 n00b_result_t(bool)
 rocs_posting_list_push(n00b_store_posting_list_t *postings,
                        uint64_t                   ordinal,
@@ -1836,32 +1885,26 @@ rocs_posting_list_push(n00b_store_posting_list_t *postings,
         if (postings->flags == nullptr) {
             return n00b_result_err(bool, N00B_STORE_INDEX_ERR_STATE);
         }
-        // The bit and the count move together, under the set's own write
-        // lock. Taking it per operation instead lets a reader land between
-        // them and see a member the count does not describe. The rwlock is
-        // reentrant, so the locked entry point below is safe to call inside
-        // this hold.
-        //
         // The count is kept rather than popcounted because a count read is
         // O(1) that way, where popcounting the bitmap is a pass over
-        // record_count/64 words on every df read.
-        n00b_flagset_write_lock(postings->flags);
-        bool old = n00b_flagset_test_and_set_index(postings->flags,
-                                                   (int64_t)ordinal,
-                                                   true);
-        if (!old) {
-            n00b_atomic_add(&postings->count, 1);
+        // record_count/64 words on every df read. A reader can see the bit
+        // before the count that describes it; the count is an estimate.
+        bool fresh = n00b_flagset_set_owned(postings->flags, ordinal);
+        if (fresh) {
+            atomic_store_explicit(&postings->count,
+                                  atomic_load_explicit(&postings->count,
+                                                       memory_order_relaxed)
+                                      + 1,
+                                  memory_order_release);
         }
-
-        n00b_flagset_unlock(postings->flags);
-        return n00b_result_ok(bool, !old);
+        return n00b_result_ok(bool, fresh);
     }
     if (postings->ordinals == nullptr) {
         return n00b_result_err(bool, N00B_STORE_INDEX_ERR_STATE);
     }
 
-    _n00b_list_write_lock(postings->ordinals);
-    size_t len = postings->ordinals->len;
+    n00b_store_posting_ordinal_list_t *list = postings->ordinals;
+    size_t len = __atomic_load_n(&list->len, __ATOMIC_RELAXED);
 
     // Ascending order is a property readers want, not a promise asked of
     // callers, so it is established when a reader needs it rather than on
@@ -1870,34 +1913,37 @@ rocs_posting_list_push(n00b_store_posting_list_t *postings,
     // caller a shift per element, and quadratic time overall.
     //
     // Appending instead is O(1) whatever the order, and an append that lands
-    // below the tail clears N00B_STORE_POSTINGS_ORDERED. That bit is what
-    // rocs_posting_list_contains_ordinal consults before binary-searching; a
-    // list that loses it stays unordered and is scanned until sealing sorts
-    // it, which costs speed on a hot shard and nothing on a sealed image.
+    // below the tail clears N00B_STORE_POSTINGS_ORDERED before the length
+    // that exposes it is published. That bit is what readers consult before
+    // binary-searching; a list that loses it stays unordered and is scanned
+    // until sealing sorts it, which costs speed on a hot shard and nothing on
+    // a sealed image.
     //
     // The tail check below still catches the duplicate that actually occurs: a
     // full-text or n-gram field emitting the same term twice pushes the same
     // ordinal twice in a row. A duplicate arriving non-consecutively survives
     // until the sort, which drops it.
     if (len != 0) {
-        uint64_t last = postings->ordinals->data[len - 1];
+        uint64_t last = list->data[len - 1];
 
         if (unique && ordinal == last) {
-            _n00b_list_unlock(postings->ordinals);
             return n00b_result_ok(bool, false);
         }
         if (ordinal < last) {
-            n00b_atomic_store(&postings->reserved,
-                              n00b_atomic_load(&postings->reserved)
-                                  & ~N00B_STORE_POSTINGS_ORDERED);
+            n00b_atomic_and(&postings->reserved, ~N00B_STORE_POSTINGS_ORDERED);
         }
     }
 
-    _n00b_list_ensure_cap(postings->ordinals, len + 1);
-    postings->ordinals->data[len] = ordinal;
-    postings->ordinals->len       = len + 1;
-    n00b_atomic_add(&postings->count, 1);
-    _n00b_list_unlock(postings->ordinals);
+    if (len == list->cap) {
+        rocs_posting_ordinals_grow(list, len + 1);
+    }
+    list->data[len] = ordinal;
+    __atomic_store_n(&list->len, len + 1, __ATOMIC_RELEASE);
+    atomic_store_explicit(&postings->count,
+                          atomic_load_explicit(&postings->count,
+                                               memory_order_relaxed)
+                              + 1,
+                          memory_order_release);
     return n00b_result_ok(bool, true);
 }
 
@@ -2040,7 +2086,7 @@ rocs_index_lookup_terms(n00b_store_index_t            *index,
 
     return rocs_postings_from_ordinals(ordinals,
                                        count,
-                                       (uint64_t)n00b_list_len(*shard->records),
+                                       n00b_store_shard_records_len(shard),
                                        shard,
                                        nullptr,
                                        shard_id,
@@ -2229,8 +2275,7 @@ n00b_store_index_add(n00b_store_index_t *index,
         return n00b_result_err(uint64_t, N00B_STORE_INDEX_ERR_STATE);
     }
 
-    size_t records_len = n00b_list_len(*shard->records);
-    if (record_ordinal >= (uint64_t)records_len) {
+    if (record_ordinal >= n00b_store_shard_records_len(shard)) {
         return n00b_result_err(uint64_t, N00B_STORE_INDEX_ERR_ARG);
     }
 
@@ -2296,11 +2341,14 @@ n00b_store_index_add(n00b_store_index_t *index,
         return n00b_result_err(uint64_t, n00b_result_get_err(terms_r));
     }
 
-    return rocs_index_add_terms(index,
-                                shard,
-                                record_ordinal,
-                                n00b_result_get(terms_r),
-                                .allocator = allocator);
+    rocs_index_writer_enter(shard);
+    auto added_r = rocs_index_add_terms(index,
+                                        shard,
+                                        record_ordinal,
+                                        n00b_result_get(terms_r),
+                                        .allocator = allocator);
+    rocs_index_writer_exit(shard);
+    return added_r;
 }
 
 n00b_result_t(n00b_store_postings_t *)
@@ -2777,11 +2825,8 @@ rocs_index_keys_for(n00b_store_index_t      *index,
 // find out.
 // A hot posting list's size.
 //
-// Read with no lock, which is why the field is atomic. Both writers hold a
-// lock over the update, but not the same one: a sparse list's is the ordinal
-// list's, a dense list's is the flag set's, and sealing writes the field under
-// neither. There is no single lock for a reader to take, and taking a writer's
-// would put a query behind ingest to read one word.
+// Read with no lock while the list's one writer updates it, which is why the
+// field is atomic.
 //
 // So it is an estimate at the moment it is read, which is what every caller
 // wants it for. Callers size work from it; none decides membership by it.
@@ -3834,12 +3879,11 @@ n00b_store_record_view_hot_at(n00b_store_shard_t *shard,
     }
 
     // Live callers bound ordinals by the post-fill publication watermark.
-    uint64_t len = (uint64_t)n00b_list_len(*shard->records);
-    if (ordinal >= len) {
+    if (ordinal >= n00b_store_shard_records_len(shard)) {
         return n00b_result_err(n00b_store_record_t *,
                                N00B_STORE_INDEX_ERR_ARG);
     }
-    if (n00b_list_get(*shard->records, (size_t)ordinal) == nullptr) {
+    if (n00b_store_shard_record_at(shard, ordinal) == nullptr) {
         return n00b_result_err(n00b_store_record_t *,
                                N00B_STORE_INDEX_ERR_STATE);
     }
@@ -3878,12 +3922,11 @@ n00b_store_record_view_hot_pos(n00b_store_shard_t *shard,
     }
 
     // Live callers bound ordinals by the post-fill publication watermark.
-    uint64_t len = (uint64_t)n00b_list_len(*shard->records);
-    if (pos.ordinal >= len) {
+    if (pos.ordinal >= n00b_store_shard_records_len(shard)) {
         return n00b_result_err(n00b_store_record_t *,
                                N00B_STORE_INDEX_ERR_ARG);
     }
-    if (n00b_list_get(*shard->records, (size_t)pos.ordinal) == nullptr) {
+    if (n00b_store_shard_record_at(shard, pos.ordinal) == nullptr) {
         return n00b_result_err(n00b_store_record_t *,
                                N00B_STORE_INDEX_ERR_STATE);
     }
@@ -4101,7 +4144,7 @@ rocs_record_hot_readable(n00b_store_record_t *record)
             && shard->state != N00B_SHARD_STATE_SEALED)) {
         return N00B_STORE_INDEX_ERR_STATE;
     }
-    if (record->pos.ordinal >= (uint64_t)n00b_list_len(*shard->records)) {
+    if (record->pos.ordinal >= n00b_store_shard_records_len(shard)) {
         return N00B_STORE_INDEX_ERR_STATE;
     }
     return N00B_STORE_INDEX_OK;
