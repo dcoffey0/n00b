@@ -505,6 +505,7 @@ process_inbound_request_frame(n00b_h3_inbound_request_t *req,
             size_t old = (size_t)req->body->byte_len;
             n00b_buffer_resize(req->body,
                                (uint64_t)(old + frame->body_len));
+            N00B_H3_DEBUG_POINT(req->chan, N00B_H3_DEBUG_BODY_GROWN);
             memcpy((uint8_t *)req->body->data + old,
                    frame->body, frame->body_len);
         }
@@ -523,13 +524,11 @@ process_inbound_request_frame(n00b_h3_inbound_request_t *req,
 }
 
 static n00b_result_t(bool)
-inbound_request_feed(n00b_h3_inbound_request_t *req,
-                     const uint8_t             *bytes,
-                     size_t                     len,
-                     bool                       fin)
+inbound_request_feed_locked(n00b_h3_inbound_request_t *req,
+                            const uint8_t             *bytes,
+                            size_t                     len,
+                            bool                       fin)
 {
-    if (!req) return n00b_result_err(bool, N00B_QUIC_ERR_NULL_ARG);
-
     ireq_recv_append(req, bytes, len);
 
     n00b_h3_server_t *server = req->server_conn->server;
@@ -573,6 +572,22 @@ inbound_request_feed(n00b_h3_inbound_request_t *req,
         }
     }
     return n00b_result_ok(bool, true);
+}
+
+static n00b_result_t(bool)
+inbound_request_feed(n00b_h3_inbound_request_t *req,
+                     const uint8_t             *bytes,
+                     size_t                     len,
+                     bool                       fin)
+{
+    if (!req) return n00b_result_err(bool, N00B_QUIC_ERR_NULL_ARG);
+
+    // A handler reads this request's body and state under the same lock
+    // from other threads.
+    n00b_data_write_lock(req->lock);
+    n00b_result_t(bool) r = inbound_request_feed_locked(req, bytes, len, fin);
+    n00b_data_unlock(req->lock);
+    return r;
 }
 
 /* ===========================================================================
@@ -717,8 +732,9 @@ sconn_discover_streams(n00b_h3_server_conn_t *sconn)
                 (uint64_t)N00B_H3_ERR_STREAM_CREATION);
             break;
         }
+        // The bytes read past the varint go back in front of the rest.
         if ((size_t)vn < got) {
-            _n00b_quic_chan_append_recv(c, tmp + vn, got - (size_t)vn);
+            _n00b_quic_chan_unread(c, tmp + vn, got - (size_t)vn);
         }
         c = nx;
     }

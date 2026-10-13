@@ -100,14 +100,8 @@ _n00b_quic_conn_default_callback(picoquic_cnx_t              *cnx,
             if (length > 0) {
                 _n00b_quic_chan_append_recv(chan, bytes, length);
             }
-            chan->recv_fin = true;
-            /* Half-close on receive side; if we already FIN'd send,
-             * the channel is fully closed. */
-            if (chan->state == N00B_QUIC_CHAN_STATE_SEND_HALF_CLOSED) {
-                chan->state = N00B_QUIC_CHAN_STATE_CLOSED;
-            } else if (chan->state == N00B_QUIC_CHAN_STATE_OPEN) {
-                chan->state = N00B_QUIC_CHAN_STATE_RECV_HALF_CLOSED;
-            }
+            _n00b_quic_chan_append_fin(chan);
+            (void)_n00b_quic_chan_transition(chan, N00B_QUIC_CHAN_EV_PEER_FIN);
         }
         break;
     }
@@ -119,7 +113,7 @@ _n00b_quic_conn_default_callback(picoquic_cnx_t              *cnx,
              * the application can inspect why the peer reset. */
             chan->app_err_peer = picoquic_get_remote_stream_error(cnx,
                                                                   stream_id);
-            chan->state = N00B_QUIC_CHAN_STATE_PEER_RESET;
+            (void)_n00b_quic_chan_transition(chan, N00B_QUIC_CHAN_EV_PEER_RESET);
         }
         break;
     }
@@ -133,7 +127,7 @@ _n00b_quic_conn_default_callback(picoquic_cnx_t              *cnx,
             pico_scope = n00b_allocator_scope_enter(N00B_PICO_ALLOC);
             (void)picoquic_reset_stream(cnx, stream_id, 0);
             n00b_allocator_scope_exit(&pico_scope);
-            chan->state = N00B_QUIC_CHAN_STATE_LOCAL_RESET;
+            (void)_n00b_quic_chan_transition(chan, N00B_QUIC_CHAN_EV_LOCAL_RESET);
         }
         break;
     }
@@ -229,7 +223,8 @@ _n00b_quic_conn_find_chan(n00b_quic_conn_t *conn, uint64_t stream_id)
         return nullptr;
     }
     n00b_quic_chan_t *c;
-    for (c = conn->channels; c != nullptr; c = c->next_in_conn) {
+    for (c = atomic_load_explicit(&conn->channels, memory_order_acquire); c != nullptr;
+         c = c->next_in_conn) {
         if (c->stream_id == stream_id) {
             return c;
         }
@@ -243,8 +238,12 @@ _n00b_quic_conn_register_chan(n00b_quic_conn_t *conn, n00b_quic_chan_t *chan)
     if (!conn || !chan) {
         return;
     }
-    chan->next_in_conn = conn->channels;
-    conn->channels     = chan;
+    n00b_assert(!conn->endpoint || !conn->endpoint->lock
+                || n00b_lock_already_owner((n00b_lock_base_t *)conn->endpoint->lock));
+
+    chan->next_in_conn = atomic_load_explicit(&conn->channels, memory_order_relaxed);
+    N00B_QUIC_DEBUG_POINT(conn, chan, N00B_QUIC_DEBUG_REGISTER);
+    atomic_store_explicit(&conn->channels, chan, memory_order_release);
 }
 
 /* ===========================================================================
@@ -264,8 +263,19 @@ _n00b_quic_conn_dgram_chan(n00b_quic_conn_t *conn)
     if (!conn) {
         return nullptr;
     }
-    if (conn->dgram_chan) {
-        return conn->dgram_chan;
+    n00b_quic_chan_t *existing = atomic_load_explicit(&conn->dgram_chan, memory_order_acquire);
+    if (existing) {
+        return existing;
+    }
+
+    // Registration needs the endpoint lock.  The pump arrives holding it,
+    // and n00b_quic_chan_open takes it here.
+    n00b_rwlock_t *lock = conn->endpoint ? conn->endpoint->lock : nullptr;
+    n00b_data_write_lock(lock);
+    existing = atomic_load_explicit(&conn->dgram_chan, memory_order_relaxed);
+    if (existing) {
+        n00b_data_unlock(lock);
+        return existing;
     }
 
     n00b_allocator_t *alloc =
@@ -288,16 +298,21 @@ _n00b_quic_conn_dgram_chan(n00b_quic_conn_t *conn)
     chan->bytes_received   = 0;
     chan->app_err_local    = 0;
     chan->app_err_peer     = 0;
-    chan->recv_buf         = nullptr;
+    atomic_store(&chan->rx_inbox, (n00b_quic_rx_chunk_t *)nullptr);
+    chan->rx_head          = nullptr;
+    chan->rx_tail          = nullptr;
     chan->dgram_recv_queue = n00b_list_new(n00b_buffer_t *, .allocator = alloc);
     chan->dgram_queue_inited = true;
     chan->sent_fin         = false;
-    chan->recv_fin         = false;
     chan->closed           = false;
     chan->last_activity_ns = (uint64_t)n00b_ns_timestamp();
+#ifdef N00B_DEBUG
+    atomic_store(&chan->rx_reader, 0);
+#endif
 
     _n00b_quic_conn_register_chan(conn, chan);
-    conn->dgram_chan = chan;
+    atomic_store_explicit(&conn->dgram_chan, chan, memory_order_release);
+    n00b_data_unlock(lock);
     return chan;
 }
 
@@ -567,7 +582,8 @@ n00b_quic_conn_stats(n00b_quic_conn_t *conn)
     uint64_t chans_open  = 0;
     uint64_t chans_total = 0;
     n00b_quic_chan_t *c;
-    for (c = conn->channels; c; c = c->next_in_conn) {
+    for (c = atomic_load_explicit(&conn->channels, memory_order_acquire); c;
+         c = c->next_in_conn) {
         chans_total++;
         n00b_quic_chan_state_t cst = c->state;
         if (cst == N00B_QUIC_CHAN_STATE_OPEN ||
@@ -620,7 +636,7 @@ n00b_quic_conn_remote_cid(n00b_quic_conn_t *conn, n00b_quic_cid_t *out)
 n00b_quic_chan_t *
 n00b_quic_conn_first_chan(n00b_quic_conn_t *conn)
 {
-    return conn ? conn->channels : nullptr;
+    return conn ? atomic_load_explicit(&conn->channels, memory_order_acquire) : nullptr;
 }
 
 bool

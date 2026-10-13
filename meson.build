@@ -6621,6 +6621,18 @@ test('quic_h3_server_loopback', quic_h3_server_loopback_test,
      suite: 'unit', timeout: 60)
 endif
 
+# The endpoint pump and the H3 drivers on separate threads over the same
+# in-process loopback, with debug hooks holding each receive-state window.
+# n00b#333: POSIX-only (raw BSD sockets); not built on Windows.
+if target_os != 'windows'
+quic_h3_pump_thread_test = executable('test_quic_h3_pump_thread',
+    ['test/unit/test_quic_h3_pump_thread.c'],
+    kwargs: quic_test_kwargs,
+)
+test('quic_h3_pump_thread', quic_h3_pump_thread_test,
+     suite: 'unit', timeout: 120)
+endif
+
 # WP-004 Phase 5 closeout — h3 mid-stream `max_body_size` enforcement
 # regression (DF-014 lift).  Pins the receive-loop guard introduced on
 # top of sub-agent 5 (`uq ae`)'s post-await check: a server that sends
