@@ -446,5 +446,11 @@ main(int argc, char **argv)
     printf("  (commit_lock and residency_lock are held for all of it)\n");
 
     CHECK(n00b_result_is_ok(n00b_store_close(store)));
+
+    // n00b#527 class: `rt` lives in this frame, and n00b_init started worker
+    // threads that read it. Returning without quiescing them let a worker read
+    // the runtime out of a dead frame during process teardown -- caught on
+    // Windows x64 as an access violation on a worker at roughly 1 run in 100.
+    n00b_shutdown();
     return 0;
 }

@@ -276,5 +276,8 @@ main(int argc, char **argv)
         }
     }
 
+    // Quiesce the runtime's worker threads before `rt` goes out of scope with
+    // this frame (n00b#527; same defect as bench_rocs_catalog_rewrite).
+    n00b_shutdown();
     return 0;
 }
