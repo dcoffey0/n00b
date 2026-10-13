@@ -30,6 +30,8 @@
 #include "n00b.h"
 #include "core/alloc.h"
 #include "core/runtime.h"
+#include "core/eintr.h"
+#include "core/time.h"
 #include "core/buffer.h"
 #include "core/string.h"
 #include "core/data_lock.h"
@@ -46,8 +48,12 @@
 
 #ifdef _WIN32
 #define N00B_METRICS_CLOSE_SOCKET(fd) closesocket((SOCKET)(fd))
-#define N00B_METRICS_READ(fd, buf, len) recv((SOCKET)(fd), (buf), (int)(len), 0)
-#define N00B_METRICS_WRITE(fd, buf, len) send((SOCKET)(fd), (const char *)(buf), (int)(len), 0)
+// eintr: Winsock calls never fail with EINTR.
+#define N00B_METRICS_READ(deadline, fd, buf, len) \
+    ((void)(deadline), recv((SOCKET)(fd), (buf), (int)(len), 0))
+// eintr: as above.
+#define N00B_METRICS_WRITE(deadline, fd, buf, len) \
+    ((void)(deadline), send((SOCKET)(fd), (const char *)(buf), (int)(len), 0))
 #define N00B_METRICS_SOCKOPT_PTR(ptr) ((const char *)(ptr))
 
 static void
@@ -65,16 +71,20 @@ metrics_prepare_blocking_socket(base_socket_t fd)
 #elif defined(__linux__)
 #define N00B_METRICS_CLOSE_SOCKET(fd) \
     ((void)_n00b_raw_linux_syscall1(SYS_close, (long)(fd)))
-#define N00B_METRICS_READ(fd, buf, len) \
-    ((ssize_t)_n00b_raw_linux_syscall3(SYS_read, \
-                                       (long)(fd), \
-                                       (long)(uintptr_t)(buf), \
-                                       (long)(len)))
-#define N00B_METRICS_WRITE(fd, buf, len) \
-    ((ssize_t)_n00b_raw_linux_syscall3(SYS_write, \
-                                       (long)(fd), \
-                                       (long)(uintptr_t)(buf), \
-                                       (long)(len)))
+#define N00B_METRICS_READ(deadline, fd, buf, len)                       \
+    n00b_retry_eintr_raw_until(                                         \
+        (deadline),                                                     \
+        (ssize_t)_n00b_raw_linux_syscall3(SYS_read,                     \
+                                          (long)(fd),                   \
+                                          (long)(uintptr_t)(buf),       \
+                                          (long)(len)))
+#define N00B_METRICS_WRITE(deadline, fd, buf, len)                      \
+    n00b_retry_eintr_raw_until(                                         \
+        (deadline),                                                     \
+        (ssize_t)_n00b_raw_linux_syscall3(SYS_write,                    \
+                                          (long)(fd),                   \
+                                          (long)(uintptr_t)(buf),       \
+                                          (long)(len)))
 
 static void
 metrics_prepare_blocking_socket(base_socket_t fd)
@@ -103,8 +113,10 @@ metrics_prepare_blocking_socket(base_socket_t fd)
 }
 #else
 #define N00B_METRICS_CLOSE_SOCKET(fd) close(fd)
-#define N00B_METRICS_READ(fd, buf, len) read((fd), (buf), (len))
-#define N00B_METRICS_WRITE(fd, buf, len) write((fd), (buf), (len))
+#define N00B_METRICS_READ(deadline, fd, buf, len) \
+    n00b_retry_eintr_until((deadline), read((fd), (buf), (len)))
+#define N00B_METRICS_WRITE(deadline, fd, buf, len) \
+    n00b_retry_eintr_until((deadline), write((fd), (buf), (len)))
 
 static void
 metrics_prepare_blocking_socket(base_socket_t fd)
@@ -119,6 +131,12 @@ metrics_prepare_blocking_socket(base_socket_t fd)
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 }
 #endif
+
+// On Linux, a signal interrupts a blocking call on a socket with a timeout
+// set even under SA_RESTART, where macOS restarts it. N00B_METRICS_READ and
+// N00B_METRICS_WRITE retry until `deadline`, which stands in for the
+// socket's own timeout.
+#define METRICS_IO_TIMEOUT_NS ((uint64_t)1000 * N00B_NS_PER_MS)
 
 /* ===========================================================================
  * Allocator
@@ -720,6 +738,24 @@ n00b_quic_metrics_listener_port(n00b_quic_metric_listener_t *l)
 
 #define METRICS_REQ_MAX 4096
 
+// Writes all of `bytes`, resuming after signals and short writes. Each
+// stretch without progress gets the socket's timeout. Returns false when the
+// peer cannot take the rest.
+static bool
+metrics_write_all(base_socket_t fd, const char *bytes, size_t len)
+{
+    while (len > 0) {
+        uint64_t deadline = n00b_ns_timestamp() + METRICS_IO_TIMEOUT_NS;
+        ssize_t  w        = N00B_METRICS_WRITE(deadline, fd, bytes, len);
+        if (w <= 0) {
+            return false;
+        }
+        bytes += w;
+        len -= (size_t)w;
+    }
+    return true;
+}
+
 void
 _n00b_quic_metrics_handle_conn(n00b_quic_metric_listener_t *l,
                                base_socket_t                fd)
@@ -734,8 +770,12 @@ _n00b_quic_metrics_handle_conn(n00b_quic_metric_listener_t *l,
      * synchronous handler doesn't spin and doesn't hang. */
     metrics_prepare_blocking_socket(fd);
 
+    uint64_t deadline = n00b_ns_timestamp() + METRICS_IO_TIMEOUT_NS;
     while (total < sizeof(buf) - 1) {
-        ssize_t n = N00B_METRICS_READ(fd, buf + total, sizeof(buf) - 1 - total);
+        ssize_t n = N00B_METRICS_READ(deadline,
+                                      fd,
+                                      buf + total,
+                                      sizeof(buf) - 1 - total);
         if (n <= 0) break;
         total += (size_t)n;
         buf[total] = '\0';
@@ -782,16 +822,13 @@ _n00b_quic_metrics_handle_conn(n00b_quic_metric_listener_t *l,
                       "Connection: close\r\n"
                       "\r\n",
                       status, status_text, body_len);
-    if (hl > 0) {
-        ssize_t w = N00B_METRICS_WRITE(fd, head, (size_t)hl);
-        (void)w;
-    }
-    if (body_buf && body_len > 0) {
-        ssize_t w = N00B_METRICS_WRITE(fd, body_buf->data, body_len);
-        (void)w;
-    } else if (body_str && body_len > 0) {
-        ssize_t w = N00B_METRICS_WRITE(fd, body_str, body_len);
-        (void)w;
+    if (hl > 0 && metrics_write_all(fd, head, (size_t)hl)) {
+        if (body_buf && body_len > 0) {
+            (void)metrics_write_all(fd, body_buf->data, body_len);
+        }
+        else if (body_str && body_len > 0) {
+            (void)metrics_write_all(fd, body_str, body_len);
+        }
     }
     N00B_METRICS_CLOSE_SOCKET(fd);
 }

@@ -513,6 +513,8 @@ static int
 ansi_read_byte(int timeout_ms)
 {
     struct pollfd pfd = { .fd = STDIN_FILENO, .events = POLLIN };
+    // eintr: EINTR ends the wait as its timeout would, so a signal between the
+    // bytes of an escape sequence splits it.
     int pr = poll(&pfd, 1, timeout_ms);
     if (pr <= 0) {
         return -1;
@@ -594,6 +596,7 @@ ansi_poll_event(void *vctx, int32_t timeout_ms, n00b_event_t *out)
         else if (timeout_ms > 0) {
             // No inbox — fall back to poll() on stdin.
             struct pollfd pfd = { .fd = STDIN_FILENO, .events = POLLIN };
+            // eintr: an early wake only re-checks for input.
             poll(&pfd, 1, timeout_ms);
         }
 

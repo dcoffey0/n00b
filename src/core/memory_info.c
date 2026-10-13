@@ -128,6 +128,7 @@ static inline int
 n00b_memperm_raw_poll(struct pollfd *fds, unsigned long nfds, int timeout_ms)
 {
 #if defined(SYS_poll)
+    // eintr: the probe polls with a zero timeout, which never sleeps.
     return (int)_n00b_raw_linux_syscall3(SYS_poll,
                                          (long)(uintptr_t)fds,
                                          (long)nfds,
@@ -142,6 +143,7 @@ n00b_memperm_raw_poll(struct pollfd *fds, unsigned long nfds, int timeout_ms)
         };
         timeout_ptr = &timeout;
     }
+    // eintr: as above.
     return (int)_n00b_raw_linux_syscall5(SYS_ppoll,
                                          (long)(uintptr_t)fds,
                                          (long)nfds,
@@ -173,6 +175,7 @@ n00b_memperm_raw_close(int fd)
 #define N00B_MEMPERM_FCNTL(fd, cmd, arg) fcntl((fd), (cmd), (arg))
 #define N00B_MEMPERM_WRITE(fd, buf, len) write((fd), (buf), (len))
 #define N00B_MEMPERM_READ(fd, buf, len)  read((fd), (buf), (len))
+// eintr: as above.
 #define N00B_MEMPERM_POLL(fds, n, to)    poll((fds), (n), (to))
 #define N00B_MEMPERM_CLOSE(fd)           close((fd))
 #define N00B_MEMPERM_ERRNO(rc)           ((rc) < 0 ? errno : 0)

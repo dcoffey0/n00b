@@ -118,6 +118,7 @@ _n00b_raw_write_once(int fd, const void *buf, unsigned long len)
 static inline long
 _n00b_raw_poll_once(struct pollfd *pfd, int timeout_ms)
 {
+    // eintr: _n00b_raw_poll_one retries -EINTR.
     register long x16 __asm__("x16") = SYS_poll;
     register long x0 __asm__("x0")   = (long)(uintptr_t)pfd;
     register long x1 __asm__("x1")   = 1;
@@ -384,6 +385,7 @@ _n00b_raw_poll_one(struct pollfd *pfd, int timeout_ms)
 
     long r;
     do {
+        // eintr: the loop retries EINTR.
         r = _n00b_raw_linux_syscall4(SYS_ppoll, (long)(uintptr_t)pfd, 1, tsp, 0);
     } while (r == -EINTR);
 
@@ -428,6 +430,7 @@ _n00b_raw_poll_one(struct pollfd *pfd, int timeout_ms)
     int  restarts = 0;
 
     do {
+        // eintr: the loop retries EINTR.
         r = (long)syscall(SYS_poll, pfd, 1, timeout_ms);
         if (r < 0) {
             r = -(long)errno;

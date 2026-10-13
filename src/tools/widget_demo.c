@@ -2366,6 +2366,8 @@ main(int argc, char **argv)
                 struct pollfd pfd = { .fd = STDIN_FILENO, .events = POLLIN };
 
                 for (;;) {
+                    // eintr: a signal ends this demo's wait for a key, as the
+                    // timeout does.
                     int pr = poll(&pfd, 1, 60000);
                     dbg("poll() returned %d, revents=0x%x\n", pr, pfd.revents);
 
