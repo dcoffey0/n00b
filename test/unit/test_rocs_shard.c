@@ -36,10 +36,8 @@ check_empty_hot_shard(n00b_store_shard_t *shard,
     CHECK(shard->seal_ts == 0);
     CHECK(shard->shard_id == shard_id);
 
-    // records is a LOCKED list: rocs_shard_record_list_new uses
-    // n00b_list_new_cap/_new (installing an rwlock) so the store can
-    // synchronize its writers through it. (retain_raw below stays private.)
-    CHECK(shard->records->lock != nullptr);
+    // records has one writer and lock-free readers, so it carries no lock.
+    CHECK(shard->records->lock == nullptr);
     CHECK(n00b_list_len(*shard->records) == 0);
 
     CHECK(shard->columns->lock != 0);
@@ -220,6 +218,21 @@ test_dense_postings(n00b_allocator_t *allocator)
     CHECK(postings->flags->lock != nullptr);
     CHECK(postings->flags->allocator == allocator);
     return postings;
+}
+
+// Bytes the marshaller copies for an allocation: the header's length, not the
+// container's idea of how much of it is in use.
+static uint64_t
+test_alloc_user_len(void *ptr)
+{
+    n00b_alloc_info_t info = n00b_find_alloc_info(ptr, .scan_for_header = true);
+
+    CHECK(n00b_alloc_info_is_heap(info));
+    if (n00b_alloc_info_is_oob(info)) {
+        n00b_oob_hdr_t *oob = info.hdr.oob;
+        return oob->hcur ? oob->alloc_len - N00B_ALLOC_HDR_SZ : oob->alloc_len;
+    }
+    return info.hdr.in_line->alloc_len - N00B_ALLOC_HDR_SZ;
 }
 
 static n00b_store_posting_list_t *
@@ -643,15 +656,27 @@ test_seal_populated_shard_without_raw(void)
     CHECK(dense->flags->lock != nullptr);
     CHECK(dense->count == 0);
 
+    // Growth to 1025 bits leaves 32 words allocated for 17 used ones. Seal
+    // trims the spare words so the image does not carry them.
+    for (int64_t bit = 64; bit <= 1024; bit *= 2) {
+        n00b_flagset_set_index(dense->flags, bit, true);
+    }
+    CHECK(dense->flags->alloc_wordlen == 32);
+    uint64_t grown_bytes = test_alloc_user_len(dense->flags->contents);
+    CHECK(grown_bytes >= 32 * sizeof(uint64_t));
+
     auto seal = n00b_store_shard_seal(shard,
                                       .seal_ts      = 28,
                                       .base_address = 0x6e00b002u);
     CHECK(n00b_result_is_ok(seal));
     CHECK(shard->records->allocator == allocator);
-    CHECK(shard->records->lock != nullptr);
     CHECK(dense->flags->allocator == allocator);
     CHECK(dense->flags->lock != nullptr);
-    CHECK(dense->count == 1);
+    CHECK(dense->count == 6);
+    CHECK(dense->flags->alloc_wordlen == 17);
+    uint64_t sealed_bytes = test_alloc_user_len(dense->flags->contents);
+    CHECK(sealed_bytes >= 17 * sizeof(uint64_t));
+    CHECK(sealed_bytes < grown_bytes);
 
     n00b_store_map_t       *map  = nullptr;
     n00b_store_map_shard_t *root = open_sealed_root(n00b_result_get(seal), &map);

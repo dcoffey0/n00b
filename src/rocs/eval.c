@@ -2000,7 +2000,7 @@ n00b_plan_exec_hot(n00b_plan_node_t   *plan,
         }
         record_count = n00b_result_get(rc_r);
     }
-    else if (record_count > (uint64_t)n00b_list_len(*shard->records)) {
+    else if (record_count > n00b_store_shard_records_len(shard)) {
         return n00b_result_err(n00b_plan_ordset_t *, N00B_PLAN_ERR_STATE);
     }
     _rocs_plan_exec_ctx_t ctx = {

@@ -1073,7 +1073,7 @@ _rocs_plan_hot_record_count(n00b_store_shard_t *shard)
         return n00b_result_err(uint64_t, N00B_PLAN_ERR_STATE);
     }
 
-    uint64_t records_len = (uint64_t)n00b_list_len(*shard->records);
+    uint64_t records_len = n00b_store_shard_records_len(shard);
     if (records_len != shard->record_count) {
         return n00b_result_err(uint64_t, N00B_PLAN_ERR_STATE);
     }
