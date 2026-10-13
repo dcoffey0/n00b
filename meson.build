@@ -2331,6 +2331,17 @@ test('rocs_retention_pinned_bench',
     env: {'ROCS_BENCH_SIZES': '8,16', 'ROCS_BENCH_RECORDS': '2'},
 )
 
+# n00b#547: a GC-heap object held only by an object in a default-configured
+# pool survives collection -- the deterministic form of the query race below.
+gc_pool_trace_test = executable('test_gc_pool_trace',
+    ['test/unit/test_gc_pool_trace.c'],
+    kwargs: test_common_kwargs,
+)
+test('gc_pool_trace_copying', gc_pool_trace_test, suite: 'unit',
+    env: {'N00B_GC_PIN_ALL': '0'})
+test('gc_pool_trace_pin_all', gc_pool_trace_test, suite: 'unit',
+    env: {'N00B_GC_PIN_ALL': '1'})
+
 bench_rocs_catalog_rewrite = executable('bench_rocs_catalog_rewrite',
     ['test/unit/bench_rocs_catalog_rewrite.c'],
     kwargs: test_common_kwargs,
