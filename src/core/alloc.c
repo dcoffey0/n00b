@@ -638,7 +638,13 @@ _n00b_alloc_raw(size_t             n,
             .scan_cb         = opts->scan_cb,
             .scan_user       = opts->scan_user,
             .hcur            = hdr,
-            .file_name       = location,
+            // The caller's site when it names one (the string constructors
+            // pass theirs down), recorded HERE, inside the metadata gate.
+            // It used to be patched in afterwards by looking the record up
+            // again and writing through it with no gate held, which a
+            // collection between the lookup and the write turned into a
+            // store into a dropped metadata arena (n00b#547).
+            .file_name       = opts->alloc_site ? opts->alloc_site : location,
             .gc_epoch        = epoch_now,
             .alive           = 1,
             .finalizer       = opts->finalizer,
