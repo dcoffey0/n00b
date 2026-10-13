@@ -514,7 +514,35 @@ typedef bool (*n00b_store_fault_hook_t)(n00b_store_fault_t fault,
  */
 extern void
 n00b_store_fault_hook_set(n00b_store_fault_hook_t hook, void *ctx);
+
+// Points on the catalog's write path where the catalog write hook runs.
+typedef enum {
+    // After records reach the catalog log durably.
+    N00B_STORE_CATALOG_LOG_APPENDED,
+    // Before a fold writes the catalog image.
+    N00B_STORE_CATALOG_FOLD_BEGIN,
+    // After a fold's image is durable, before the log two epochs back is
+    // deleted.
+    N00B_STORE_CATALOG_FOLD_WRITTEN,
+} n00b_store_catalog_write_site_t;
+
+typedef void (*n00b_store_catalog_write_hook_t)(
+    n00b_store_t                   *store,
+    n00b_store_catalog_write_site_t site,
+    void                           *ctx);
+
+/**
+ * @brief Install a process-wide catalog write hook, or clear it with
+ *        nullptr. Only under @c N00B_DEBUG.
+ */
+extern void
+n00b_store_catalog_write_hook_set(n00b_store_catalog_write_hook_t hook,
+                                  void                           *ctx);
 #endif
+
+// A fold waits for at least this many catalog log records, and for the log
+// to reach half the image's size.
+#define N00B_STORE_CATALOG_FOLD_MIN_RECORDS 32
 
 /**
  * @brief Test-control guard for borrowed catalog enumeration helpers.

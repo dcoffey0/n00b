@@ -388,12 +388,17 @@ one_shard_store(void)
     return vfs;
 }
 
-// The v5 layout of a catalog holding one entry: magic, eight header u64s
-// (version at byte 8, entry count at byte 64), then the entry's seven u64s and
-// three length-prefixed strings, then its TERM summary trailer. The trailer is
+// The v7 layout of a catalog holding one entry: magic, ten header u64s
+// (version at byte 8, log epoch and log id at bytes 64 and 72, entry count
+// at byte 80), then the entry's seven u64s and three length-prefixed
+// strings, then its TERM summary trailer. The trailer is
 // a field count and, per field, its name and key count, then for a nonzero
 // count k, bit count, and the filter bytes as a length and that many bytes.
-#define ENTRY_AT   72
+#define ENTRY_AT   88
+// Versions before 7 have no log epoch or log id, the sixteen bytes at
+// EPOCH_AT.
+#define EPOCH_AT   64
+#define EPOCH_LEN  16
 #define MAX_FIELDS 4
 
 typedef struct {
@@ -445,8 +450,8 @@ walk_trailer(n00b_buffer_t *image)
 {
     trailer_t t = {};
     CHECK(memcmp(image->data, "ROCSCAT1", 8) == 0);
-    CHECK(get_u64(image, 8) == 6);
-    CHECK(get_u64(image, 64) == 1);
+    CHECK(get_u64(image, 8) == 7);
+    CHECK(get_u64(image, 80) == 1);
     int64_t at = ENTRY_AT + 7 * 8;
     for (int i = 0; i < 3; i++) {
         at = skip_string(image, at);
@@ -531,7 +536,10 @@ v4_image(n00b_buffer_t *v5, const n00b_uint128_t *keys, size_t n)
 {
     trailer_t t   = walk_trailer(v5);
     image_t   img = {};
-    image_put(&img, v5->data, t.nsum_at);
+    image_put(&img, v5->data, EPOCH_AT);
+    image_put(&img,
+              v5->data + EPOCH_AT + EPOCH_LEN,
+              t.nsum_at - EPOCH_AT - EPOCH_LEN);
     image_u64(&img, 3);
     image_name(&img, "kind");
     image_u64(&img, n);
@@ -644,9 +652,16 @@ test_v3_catalog_still_maps(void)
     n00b_buffer_t *image = read_catalog(vfs);
     trailer_t      t     = walk_trailer(image);
 
-    // Relabel the header and strip the only entry's trailer.
-    put_u64(image, 8, 3);
-    write_catalog(vfs, n00b_buffer_from_bytes(image->data, t.nsum_at));
+    // Relabel the header, drop the epoch and log id, and strip the only
+    // entry's trailer.
+    image_t img = {};
+    image_put(&img, image->data, EPOCH_AT);
+    image_put(&img,
+              image->data + EPOCH_AT + EPOCH_LEN,
+              t.nsum_at - EPOCH_AT - EPOCH_LEN);
+    n00b_buffer_t *v3 = image_done(&img);
+    put_u64(v3, 8, 3);
+    write_catalog(vfs, v3);
 
     n00b_store_t *store = open_store(vfs);
     CHECK(!n00b_store_opened_degraded(store));
@@ -1010,7 +1025,7 @@ test_v4_catalog_loads_as_filter(void)
     ingest(store, 4, "d", nullptr);
     seal(store, 2000);
     close_store(store);
-    CHECK(get_u64(read_catalog(vfs), 8) == 6);
+    CHECK(get_u64(read_catalog(vfs), 8) == 7);
 
     store = open_store(vfs);
     entry = visible_entry(store, 0);

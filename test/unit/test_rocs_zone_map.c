@@ -800,9 +800,14 @@ downgrade_catalog(n00b_vfs_t *vfs, uint8_t version)
     }
 
     // generation, next open shard id, schema generation, the oldest-available
-    // triple, then the entry count: seven in all.
+    // triple, the log epoch and log id, then the entry count. The older
+    // versions have neither of the log words.
     int64_t pos = 16;
-    for (int64_t f = 0; f < 7; f++) {
+    for (int64_t f = 0; f < 9; f++) {
+        if (f == 6 || f == 7) {
+            pos += 8;
+            continue;
+        }
         for (int64_t i = 0; i < 8; i++) {
             out[n++] = (uint8_t)in->data[pos++];
         }
@@ -916,7 +921,7 @@ test_catalog_round_trips_and_opens_older_versions(void)
         CHECK(n00b_result_is_ok(n00b_store_close(store)));
 
         // What this build writes.
-        CHECK(catalog_version_of(vfs) == 6);
+        CHECK(catalog_version_of(vfs) == 7);
 
         // And reads back, bounds included.
         n00b_store_t *reopened = open_store(vfs);
@@ -942,7 +947,7 @@ test_catalog_round_trips_and_opens_older_versions(void)
         // And sealing a new shard into it writes the current version again.
         ingest(old, record_ts(9001, 9001));
         seal(old, 2000);
-        CHECK(catalog_version_of(vfs) == 6);
+        CHECK(catalog_version_of(vfs) == 7);
         CHECK(n00b_result_is_ok(n00b_store_close(old)));
     }
 }

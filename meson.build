@@ -2622,6 +2622,12 @@ rocs_store_catalog_test = executable('test_rocs_store_catalog',
 )
 test('rocs_store_catalog', rocs_store_catalog_test, suite: 'unit')
 
+rocs_catalog_log_test = executable('test_rocs_catalog_log',
+    ['test/unit/test_rocs_catalog_log.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_catalog_log', rocs_catalog_log_test, suite: 'unit')
+
 rocs_service_config_test = executable('test_rocs_service_config',
     ['test/unit/test_rocs_service_config.c'],
     kwargs: test_common_kwargs,

@@ -433,6 +433,42 @@ local_put_if_absent(void *ctx, n00b_string_t *path, n00b_buffer_t *data)
 }
 
 static n00b_result_t(bool)
+local_append(void *ctx, n00b_string_t *path, n00b_buffer_t *data)
+{
+    local_ctx_t   *lc   = ctx;
+    char          *full = join_path(lc, path);
+    n00b_string_t *dest = n00b_string_from_cstr(full, .allocator = lc->allocator);
+
+    auto open_r = n00b_file_open(dest,
+                                 .mode = N00B_FILE_WRITE | N00B_FILE_CREATE
+                                       | N00B_FILE_APPEND,
+                                 .kind = N00B_FILE_KIND_STREAM);
+    if (n00b_result_is_err(open_r)) {
+        return n00b_result_err(bool,
+                               errno_to_vfs_err(n00b_result_get_err(open_r)));
+    }
+
+    n00b_file_t *file    = n00b_result_get(open_r);
+    auto         write_r = n00b_file_write_all(file, data);
+    if (n00b_result_is_err(write_r)) {
+        n00b_err_t err = n00b_result_get_err(write_r);
+        (void)n00b_file_close_result(file);
+        return n00b_result_err(bool, errno_to_vfs_err(err));
+    }
+    if (n00b_result_get(write_r) != n00b_buffer_len(data)) {
+        (void)n00b_file_close_result(file);
+        return n00b_result_err(bool, N00B_VFS_ERR_IO);
+    }
+
+    auto close_r = n00b_file_close_result(file);
+    if (n00b_result_is_err(close_r)) {
+        return n00b_result_err(bool,
+                               errno_to_vfs_err(n00b_result_get_err(close_r)));
+    }
+    return n00b_result_ok(bool, true);
+}
+
+static n00b_result_t(bool)
 local_del(void *ctx, n00b_string_t *path)
 {
     local_ctx_t *lc   = ctx;
@@ -683,6 +719,7 @@ const n00b_vfs_backend_ops_t n00b_vfs_backend_local_ops = {
     .get_range           = local_get_range,
     .put                 = local_put,
     .put_if_absent       = local_put_if_absent,
+    .append              = local_append,
     .del                 = local_del,
     .stat                = local_stat,
     .list                = local_list,
