@@ -27,18 +27,20 @@ typedef struct {
 static void
 set_ptr_words(void *obj, uint32_t ptr_words)
 {
-    n00b_alloc_info_t info = n00b_find_alloc_info(obj);
+    bool              pin  = false;
+    n00b_alloc_info_t info = n00b_find_alloc_info(obj, .pin = &pin);
 
     if (info.kind == n00b_alloc_oob) {
         info.hdr.oob->ptr_words = ptr_words;
         if (info.hdr.oob->hcur != nullptr) {
             info.hdr.oob->hcur->ptr_words = ptr_words;
         }
-        return;
     }
-
-    CHECK(info.kind == n00b_alloc_inline);
-    info.hdr.in_line->ptr_words = ptr_words;
+    else {
+        CHECK(info.kind == n00b_alloc_inline);
+        info.hdr.in_line->ptr_words = ptr_words;
+    }
+    n00b_alloc_hdr_unpin(pin);
 }
 
 static void *

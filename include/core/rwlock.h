@@ -99,6 +99,14 @@ extern uint64_t n00b_rw_debug_write_acquires(void);
 extern void n00b_rw_adopt_read_hold(n00b_rwlock_t *lock, n00b_thread_t *thread);
 
 /**
+ * @brief True if the calling thread holds @p lock, for read or for write.
+ *
+ * Read holds are found through the thread's read log, so a thread without a
+ * TCB, whose read holds are untracked, gets false for a read hold.
+ */
+extern bool n00b_rw_held_by_self(n00b_rwlock_t *lock);
+
+/**
  * @brief Drop one reader unit from a rwlock futex, with an underflow guard.
  *
  * Internal helper shared by the unlock path and the thread-teardown sweep so

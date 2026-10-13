@@ -134,19 +134,26 @@ typedef struct {
 static void
 rocs_apply_struct_field_scan(void *ptr, const n00b_gc_struct_array_t *shape)
 {
-    n00b_alloc_info_t ai = n00b_find_alloc_info(ptr, .scan_for_header = true);
+    bool              pin = false;
+    n00b_alloc_info_t ai  = n00b_find_alloc_info(ptr,
+                                                 .scan_for_header = true,
+                                                 .pin             = &pin);
     if (ai.kind == n00b_alloc_inline && ai.hdr.in_line != nullptr) {
         ai.hdr.in_line->scan_kind = N00B_GC_SCAN_KIND_CALLBACK;
         ai.hdr.in_line->scan_cb   = n00b_gc_scan_cb_struct_field;
         ai.hdr.in_line->scan_user = (void *)shape;
     }
+    n00b_alloc_hdr_unpin(pin);
 }
 
 static void
 rocs_apply_scan_kind(void *ptr, n00b_gc_scan_kind_t scan_kind)
 {
-    n00b_alloc_info_t ai = n00b_find_alloc_info(ptr, .scan_for_header = true);
-    bool no_scan = scan_kind == N00B_GC_SCAN_KIND_NONE;
+    bool              pin     = false;
+    n00b_alloc_info_t ai      = n00b_find_alloc_info(ptr,
+                                                     .scan_for_header = true,
+                                                     .pin             = &pin);
+    bool              no_scan = scan_kind == N00B_GC_SCAN_KIND_NONE;
     if (ai.kind == n00b_alloc_inline && ai.hdr.in_line != nullptr) {
         ai.hdr.in_line->scan_kind = scan_kind;
         ai.hdr.in_line->no_scan   = no_scan;
@@ -159,6 +166,7 @@ rocs_apply_scan_kind(void *ptr, n00b_gc_scan_kind_t scan_kind)
         ai.hdr.oob->scan_cb   = nullptr;
         ai.hdr.oob->scan_user = nullptr;
     }
+    n00b_alloc_hdr_unpin(pin);
 }
 
 static void
@@ -1028,13 +1036,16 @@ n00b_store_shard_new() _kargs
     // on this shard's inline header so the marshal scans only the 4 pointer
     // words and not the scalar byte_estimate.  Marshal/GC read scan_cb from the
     // inline header; only this object is affected.
-    n00b_alloc_info_t shard_ai = n00b_find_alloc_info(shard,
-                                                      .scan_for_header = true);
+    bool              shard_pin = false;
+    n00b_alloc_info_t shard_ai  = n00b_find_alloc_info(shard,
+                                                       .scan_for_header = true,
+                                                       .pin             = &shard_pin);
     if (shard_ai.kind == n00b_alloc_inline && shard_ai.hdr.in_line != nullptr) {
         shard_ai.hdr.in_line->scan_kind = N00B_GC_SCAN_KIND_CALLBACK;
         shard_ai.hdr.in_line->scan_cb   = n00b_gc_scan_cb_struct_field;
         shard_ai.hdr.in_line->scan_user = (void *)&rocs_shard_pointer_prefix_shape;
     }
+    n00b_alloc_hdr_unpin(shard_pin);
 
     shard->records       = rocs_shard_record_list_new(.allocator  = allocator,
                                                        .record_cap = record_cap);

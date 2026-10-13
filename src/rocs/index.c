@@ -605,7 +605,10 @@ rocs_posting_list_apply_scan(n00b_store_posting_list_t *postings)
     // covers an allocator that could not record a callback at alloc time
     // (a hidden inline-header pool on an older runtime), the same belt and
     // braces the shard root uses.
-    n00b_alloc_info_t ai = n00b_find_alloc_info(postings, .scan_for_header = true);
+    bool              pin = false;
+    n00b_alloc_info_t ai  = n00b_find_alloc_info(postings,
+                                                 .scan_for_header = true,
+                                                 .pin             = &pin);
     if (ai.kind == n00b_alloc_inline && ai.hdr.in_line != nullptr) {
         ai.hdr.in_line->scan_kind = N00B_GC_SCAN_KIND_CALLBACK;
         ai.hdr.in_line->scan_cb   = n00b_gc_scan_cb_struct_field;
@@ -616,6 +619,7 @@ rocs_posting_list_apply_scan(n00b_store_posting_list_t *postings)
         ai.hdr.oob->scan_cb   = n00b_gc_scan_cb_struct_field;
         ai.hdr.oob->scan_user = (void *)&rocs_posting_list_pointer_shape;
     }
+    n00b_alloc_hdr_unpin(pin);
 }
 
 n00b_store_posting_list_t *

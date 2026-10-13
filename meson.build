@@ -2354,6 +2354,22 @@ test('rocs_query_race', rocs_query_race_test, suite: 'unit',
     env: {'N00B_QUERY_RACE_SECONDS': '4',
           'N00B_QUERY_RACE_GC_PRESSURE': '16'})
 
+bench_gc_pause_budget = executable('bench_gc_pause_budget',
+    ['test/unit/bench_gc_pause_budget.c'],
+    kwargs: test_common_kwargs,
+)
+
+# n00b#539. runtime.h documents a 0.25s pause budget that nothing enforced;
+# this is the assertion. Registered small so it gates pause REGRESSIONS on
+# every run -- the survivor sweep that shows the growth shape wants the binary
+# run directly with N00B_BENCH_SURVIVORS.
+test('gc_pause_budget',
+    bench_gc_pause_budget,
+    suite: 'unit',
+    env: {'N00B_BENCH_SURVIVORS': '2000,4000',
+          'N00B_BENCH_PAUSE_BUDGET_MS': '250'},
+)
+
 bench_rocs_catalog_rewrite = executable('bench_rocs_catalog_rewrite',
     ['test/unit/bench_rocs_catalog_rewrite.c'],
     kwargs: test_common_kwargs,
@@ -2875,6 +2891,17 @@ arena_segment_stw_race_test = executable('test_arena_segment_stw_race',
 )
 test('arena_segment_stw_race', arena_segment_stw_race_test, suite: 'unit',
      timeout: 180)
+
+# An allocation header used across a collection. POSIX-only: the guard case
+# re-runs the binary with fork and exec.
+if target_os != 'windows'
+alloc_hdr_stw_race_test = executable('test_alloc_hdr_stw_race',
+    ['test/unit/test_alloc_hdr_stw_race.c'],
+    kwargs: test_common_kwargs,
+)
+test('alloc_hdr_stw_race', alloc_hdr_stw_race_test, suite: 'unit',
+     timeout: 120)
+endif
 
 # n00b-lang/n00b#432: the marshal's private scratch pool must stay within a
 # small multiple of the image it produces.  It used to retain one block per
