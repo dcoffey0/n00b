@@ -3730,6 +3730,12 @@ gc_test = executable('test_gc',
 test('gc', gc_test, suite: 'unit')
 test('gc_pin_all', gc_test, suite: 'unit', env: ['N00B_GC_PIN_ALL=1'])
 
+mmap_registry_reads_test = executable('test_mmap_registry_reads',
+    ['test/unit/test_mmap_registry_reads.c'],
+    kwargs: test_common_kwargs,
+)
+test('mmap_registry_reads', mmap_registry_reads_test, suite: 'unit')
+
 # Verifies availability reporting in default builds and attribution when
 # debug_live_census is enabled.
 pool_audit_test = executable('test_pool_audit',

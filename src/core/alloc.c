@@ -1671,7 +1671,7 @@ find_sentinal_memo(uint64_t          *p0,
 }
 
 static inline char *
-_find_sentinal(uint64_t p_num, n00b_mmap_info_t *map, n00b_guard_memo_t *memo)
+_find_sentinal(uint64_t p_num, const n00b_mmap_view_t *map, n00b_guard_memo_t *memo)
 {
     uint64_t *start = (uint64_t *)map->start;
     uint64_t *p     = (uint64_t *)n00b_align_floor(p_num, sizeof(void *));
@@ -1692,8 +1692,7 @@ _find_sentinal(uint64_t p_num, n00b_mmap_info_t *map, n00b_guard_memo_t *memo)
     // Round the byte high-water mark UP to whole words: a guard sits at the
     // allocation's first word, so scanning a partial word short of it would
     // reintroduce exactly the off-by-a-little miss this bound exists to stop.
-    uint64_t max_len = atomic_load_explicit(&map->max_alloc_len,
-                                            memory_order_relaxed);
+    uint64_t max_len = map->max_alloc_len;
 
     uint64_t cap_words;
 
@@ -1776,26 +1775,29 @@ _find_sentinal(uint64_t p_num, n00b_mmap_info_t *map, n00b_guard_memo_t *memo)
 // Returns nullptr if not found. This obviously should all change to
 // return a variant, once I revisit variants.
 
+// `hint`, when it covers `addr`, is a registry record whose lifetime the
+// caller controls (the collector's, under stop-the-world); any other lookup
+// copies the record out under the registry lock.
 [[n00b::nogc]] static void
 find_alloc_info(void                *addr,
                 n00b_alloc_info_t   *result,
                 bool                 scan_for_header,
                 n00b_guard_memo_t   *guard_memo,
-                n00b_mmap_info_t    *mmap,
+                n00b_mmap_info_t    *hint,
                 bool                *pin)
 {
-    char *p = (char *)addr;
+    n00b_mmap_view_t view;
+    char            *p = (char *)addr;
 
-    if (mmap == nullptr || (uint64_t)addr < mmap->start || (uint64_t)addr >= mmap->end) {
-        auto mmap_opt = n00b_mmap_by_address(addr);
-
-        if (!n00b_option_is_set(mmap_opt)) {
-            *result = (n00b_alloc_info_t){.kind = n00b_alloc_none};
-            return;
-        }
-        mmap = n00b_option_get(mmap_opt);
+    if (hint != nullptr && (uint64_t)addr >= hint->start && (uint64_t)addr < hint->end) {
+        n00b_mmap_view_of(hint, &view);
+    }
+    else if (!n00b_mmap_view_by_address(addr, &view)) {
+        *result = (n00b_alloc_info_t){.kind = n00b_alloc_none};
+        return;
     }
 
+    n00b_mmap_view_t *mmap = &view;
     n00b_allocator_t *al   = mmap->allocator;
     switch (mmap->kind) {
     case n00b_mmap_static: {
