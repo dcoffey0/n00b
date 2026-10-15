@@ -175,6 +175,38 @@ main(int argc, char **argv)
         }
     }
 
+    // Name what is missing. Lost lines at the end of every thread's run are
+    // output the child queued and never wrote before it exited; a gap in the
+    // middle would be something else entirely.
+    if (seen != (uint64_t)EMIT_LINES && cap != nullptr) {
+        static uint8_t got[EMIT_THREADS + 1][EMIT_LINES / EMIT_THREADS];
+        int64_t        len  = 0;
+        char          *data = n00b_buffer_to_c(cap, &len);
+        for (int64_t i = 0; i + 8 <= len; i++) {
+            unsigned t = 0, q = 0;
+            if (memcmp(data + i, LINE_PREFIX, 8) == 0
+                && sscanf(data + i + 8, " %u %u", &t, &q) == 2
+                && t >= 1 && t <= EMIT_THREADS
+                && q < EMIT_LINES / EMIT_THREADS) {
+                got[t][q] = 1;
+            }
+        }
+        for (unsigned t = 1; t <= EMIT_THREADS; t++) {
+            int first = -1;
+            for (int q = 0; q <= EMIT_LINES / EMIT_THREADS; q++) {
+                bool missing = q < EMIT_LINES / EMIT_THREADS && !got[t][q];
+                if (missing && first < 0) {
+                    first = q;
+                }
+                else if (!missing && first >= 0) {
+                    printf("  [MISSING] thread %u lines %d..%d\n", t, first,
+                           q - 1);
+                    first = -1;
+                }
+            }
+        }
+    }
+
     printf("  [OK] emitter finished: %lld stderr bytes, %llu lines (expected %d)\n",
            (long long)n, (unsigned long long)seen, EMIT_LINES);
     fflush(stdout);

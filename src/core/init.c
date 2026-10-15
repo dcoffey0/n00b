@@ -38,6 +38,7 @@
 #include "conduit/service.h"
 #include "conduit/fd_managed.h"
 #include "conduit/fd_writer.h"
+#include "conduit/xform.h"
 #include "conduit/io.h"
 #include "parsers/tokenizer_registry.h"
 #include "display/render/backend_registry.h"
@@ -241,8 +242,12 @@ setup_default_conduit(n00b_runtime_t *rt)
 
             if (out_typed) {
                 rt->stdout_topic = (n00b_conduit_topic_base_t *)out_typed;
-                n00b_conduit_fd_writer_new(rt->default_conduit,
-                                            out_typed, 1);
+                auto out_w = n00b_conduit_fd_writer_new(rt->default_conduit,
+                                                        out_typed, 1);
+                if (n00b_result_is_ok(out_w)) {
+                    rt->stdout_writer = (n00b_conduit_xform_base_t *)
+                        n00b_result_get(out_w);
+                }
             }
 
             auto *err_typed = n00b_conduit_topic_init(
@@ -252,10 +257,39 @@ setup_default_conduit(n00b_runtime_t *rt)
 
             if (err_typed) {
                 rt->stderr_topic = (n00b_conduit_topic_base_t *)err_typed;
-                n00b_conduit_fd_writer_new(rt->default_conduit,
-                                            err_typed, 2);
+                auto err_w = n00b_conduit_fd_writer_new(rt->default_conduit,
+                                                        err_typed, 2);
+                if (n00b_result_is_ok(err_w)) {
+                    rt->stderr_writer = (n00b_conduit_xform_base_t *)
+                        n00b_result_get(err_w);
+                }
             }
         }
+    }
+}
+
+// A print returns once its line is in the stdio writer's inbox, not once it
+// is written: the done signal it waits on is shared per topic, so any one
+// line's completion releases every printer waiting on it. The writer used to
+// stop with the conduit, and whatever it still had queued was never written.
+// Closing the topic makes it finish the queue and exit (xform.h: user messages
+// drain before TOPIC_CLOSED is acted on). A print after this gets CLOSED and
+// print.c writes it to the fd directly. Bounded, like the owner flush below.
+static void
+stdio_writer_drain(n00b_conduit_topic_base_t *topic,
+                   n00b_conduit_xform_base_t *writer,
+                   int64_t                    timeout_ms)
+{
+    if (topic == nullptr || writer == nullptr || writer->thread == nullptr) {
+        return;
+    }
+
+    n00b_conduit_topic_close(topic);
+
+    int64_t deadline = n00b_ns_timestamp() + timeout_ms * N00B_NS_PER_MS;
+    while (n00b_atomic_load(&writer->thread->join_futex) == 0
+           && n00b_ns_timestamp() < deadline) {
+        base_nanosleep_ns(N00B_NS_PER_MS);
     }
 }
 
@@ -289,6 +323,9 @@ n00b_shutdown() _kargs
     }
 
     n00b_runtime_signal_defaults_begin_shutdown(rt);
+
+    stdio_writer_drain(rt->stdout_topic, rt->stdout_writer, 2000);
+    stdio_writer_drain(rt->stderr_topic, rt->stderr_writer, 2000);
 
     // Output whose blocking write timed out is still queued. Bounded, so a
     // consumer that never reads cannot hold up exit.

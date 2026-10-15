@@ -182,6 +182,10 @@ struct n00b_runtime_t {
     n00b_conduit_fd_owner_t   *stderr_owner;    // Managed fd 2.
     n00b_conduit_topic_base_t *stdout_topic;    // Typed stdout buffer topic.
     n00b_conduit_topic_base_t *stderr_topic;    // Typed stderr buffer topic.
+    // The fd_writer sinks draining those topics, so n00b_shutdown can let
+    // them finish before the conduit stops.
+    struct n00b_conduit_xform_base *stdout_writer;
+    struct n00b_conduit_xform_base *stderr_writer;
     /* Thread slot table.  Sized at init time per the @c max_threads
      * kwarg (defaults to @c N00B_THREADS_MAX).  Allocated from
      * @c system_pool so that other threads can read it safely
