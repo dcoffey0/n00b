@@ -81,6 +81,21 @@ static int
 fd_read_portable(int fd, char *buf, int len)
 {
 #ifdef _WIN32
+    // The POSIX read end is O_NONBLOCK (run_arm). An anonymous pipe has no
+    // such mode, so read only what is already waiting. A blocking _read parks
+    // the drainer until the next byte, and once the peers are done no byte
+    // comes, so drain_stop is never seen and joining the drainer never returns.
+    DWORD avail = 0;
+    if (!PeekNamedPipe((HANDLE)_get_osfhandle(fd), nullptr, 0, nullptr,
+                       &avail, nullptr)) {
+        return 0; // the write end is gone
+    }
+    if (avail == 0) {
+        return -1;
+    }
+    if (avail < (DWORD)len) {
+        len = (int)avail;
+    }
     return _read(fd, buf, (unsigned int)len);
 #else
     return (int)read(fd, buf, (size_t)len);
@@ -162,7 +177,7 @@ run_arm(const char *label, bool drain)
 
 #ifndef _WIN32
     // Non-blocking read end: the drainer must never block, or it becomes the
-    // thing under test instead of the emitters.
+    // thing under test instead of the emitters. (Windows: fd_read_portable.)
     int fl = fcntl(fds[0], F_GETFL);
     fcntl(fds[0], F_SETFL, fl | O_NONBLOCK);
 #endif
