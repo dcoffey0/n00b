@@ -511,14 +511,14 @@ n00b_mmap_info_lookup(const void *addr)
 n00b_option_t(n00b_allocator_t *)
 n00b_find_allocator(void *val)
 {
-    auto mmap_opt = n00b_mmap_info_lookup(val);
-
-    if (!n00b_option_is_set(mmap_opt)) {
-        return n00b_option_none(n00b_allocator_t *);
+    n00b_mmap_view_t view;
+    if (n00b_mmap_view_by_address(val, &view)) {
+        if (view.kind == n00b_mmap_zero_page) {
+            return n00b_option_none(n00b_allocator_t *);
+        }
+        return n00b_option_from_nullable(n00b_allocator_t *, view.allocator);
     }
-
-    n00b_mmap_info_t *mmap = n00b_option_get(mmap_opt);
-    return n00b_option_from_nullable(n00b_allocator_t *, atomic_load(&mmap->allocator));
+    return n00b_option_none(n00b_allocator_t *);
 }
 // clang-format on
 
@@ -544,9 +544,9 @@ _Atomic uint64_t n00b_memperm_indeterminate = 0;
 n00b_mmap_perms_t
 n00b_check_memory_perms(void *ptr)
 {
-    auto map_opt = n00b_mmap_by_address(ptr);
-    if (n00b_option_is_set(map_opt)) {
-        n00b_mmap_info_t *map = n00b_option_get(map_opt);
+    n00b_mmap_view_t view;
+    if (n00b_mmap_view_by_address(ptr, &view)) {
+        n00b_mmap_view_t *map = &view;
         if (map->kind == n00b_mmap_zero_page) {
             atomic_fetch_add_explicit(&n00b_memperm_fastpath_hits,
                                       1,
@@ -839,28 +839,38 @@ n00b_memory_scan_next(n00b_memory_scan_t   *ctx,
                       n00b_mmap_rec_kind_t *tinfo,
                       n00b_mmap_perms_t    *perms)
 {
-    void             *result = nullptr;
-    void             *target = nullptr;
-    n00b_mmap_info_t *mmap   = nullptr;
+    void                *result = nullptr;
+    void                *target = nullptr;
+    n00b_mmap_rec_kind_t kind   = 0;
 
     while (!result && (ctx->cur < ctx->end)) {
-        void *val     = (void *)*ctx->cur;
-        auto  mmap_opt = n00b_mmap_info_lookup(val);
+        void            *val   = (void *)*ctx->cur;
+        bool             found = false;
+        n00b_mmap_view_t view;
 
-        if (n00b_option_is_set(mmap_opt)) {
-            mmap = n00b_option_get(mmap_opt);
-            if (mmap->kind & ctx->flags) {
-                result   = (void *)ctx->cur;
-                target   = val;
-                ctx->cur = ctx->cur + 1;
-                break;
+        if (n00b_mmap_view_by_address(val, &view)) {
+            found = view.kind != n00b_mmap_zero_page;
+            kind  = view.kind;
+        }
+        else {
+            // Kernel-probed records are recycled in place and never freed.
+            auto mmap_opt = n00b_mmap_info_lookup(val);
+            if (n00b_option_is_set(mmap_opt)) {
+                found = true;
+                kind  = n00b_option_get(mmap_opt)->kind;
             }
         }
-        mmap     = nullptr;
+
+        if (found && (kind & ctx->flags)) {
+            result   = (void *)ctx->cur;
+            target   = val;
+            ctx->cur = ctx->cur + 1;
+            break;
+        }
         ctx->cur = ctx->cur + 1;
     }
 
-    if (!mmap) {
+    if (!result) {
         return n00b_option_none(void *);
     }
 
@@ -869,7 +879,7 @@ n00b_memory_scan_next(n00b_memory_scan_t   *ctx,
     }
 
     if (tinfo) {
-        *tinfo = mmap->kind;
+        *tinfo = kind;
     }
 
     return n00b_option_set(void *, result);

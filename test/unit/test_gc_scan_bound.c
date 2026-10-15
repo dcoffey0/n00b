@@ -213,7 +213,11 @@ check_scan_actually_walks_less(void)
     uint64_t words0 = atomic_load(&n00b_sentinel_scan_words);
 
     for (int i = 0; i < 64; i++) {
-        (void)n00b_find_alloc_info(probe + i * 8, .scan_for_header = true);
+        bool pin = false;
+        (void)n00b_find_alloc_info(probe + i * 8,
+                                   .scan_for_header = true,
+                                   .pin             = &pin);
+        n00b_alloc_hdr_unpin(pin);
     }
 
     uint64_t calls = atomic_load(&n00b_sentinel_scan_calls) - calls0;
@@ -253,7 +257,9 @@ check_scan_actually_walks_less(void)
 static void
 check_interior_still_resolves(uint8_t *base, size_t len)
 {
-    n00b_alloc_info_t base_info = n00b_find_alloc_info(base);
+    bool              base_pin  = false;
+    n00b_alloc_info_t base_info = n00b_find_alloc_info(base, .pin = &base_pin);
+    n00b_alloc_hdr_unpin(base_pin);
 
     if (!n00b_alloc_info_is_heap(base_info)) {
         fail("the base of the probe allocation does not resolve");
@@ -271,8 +277,11 @@ check_interior_still_resolves(uint8_t *base, size_t len)
             off = len - 8;
         }
 
+        bool              pin = false;
         n00b_alloc_info_t got = n00b_find_alloc_info(base + off,
-                                                     .scan_for_header = true);
+                                                     .scan_for_header = true,
+                                                     .pin             = &pin);
+        n00b_alloc_hdr_unpin(pin);
 
         if (!n00b_alloc_info_is_heap(got) || got.kind != base_info.kind
             || got.hdr.in_line != base_info.hdr.in_line) {
@@ -357,10 +366,16 @@ main(int argc, char **argv)
         /* And the bound must still REJECT a candidate that is not inside any
          * allocation -- a scan "fixed" by accepting whatever it lands on
          * would pass every check above. */
+        bool              bogus_pin = false;
+        bool              probe_pin = false;
         n00b_alloc_info_t bogus
             = n00b_find_alloc_info((void *)((uintptr_t)probe - 64),
-                                   .scan_for_header = true);
-        n00b_alloc_info_t probe_info = n00b_find_alloc_info(probe);
+                                   .scan_for_header = true,
+                                   .pin             = &bogus_pin);
+        n00b_alloc_hdr_unpin(bogus_pin);
+        n00b_alloc_info_t probe_info = n00b_find_alloc_info(probe,
+                                                            .pin = &probe_pin);
+        n00b_alloc_hdr_unpin(probe_pin);
 
         if (n00b_alloc_info_is_heap(bogus)
             && bogus.kind == probe_info.kind

@@ -224,11 +224,34 @@ def self_test() -> int:
                   f"flagged={flagged} expected={should_flag}")
             failures += not ok
 
+        # The file SELECTION is part of the guard too: a bench that is never
+        # looked at cannot be flagged, which is how the n00b#527 fix missed two.
+        sel = Path(td) / "selection"
+        sel.mkdir()
+        for name in ("test_a.c", "bench_b.c", "helper_c.c"):
+            (sel / name).write_text("int main(){ n00b_init(&rt,argc,argv); }")
+        picked = sorted(f.name for f in candidate_files(sel))
+        ok = picked == ["bench_b.c", "test_a.c"]
+        print(f"  [{'PASS' if ok else 'FAIL'}] self-test selection: "
+              f"picked={picked}")
+        failures += not ok
+
     if failures:
         print(f"\nself-test: {failures} case(s) failed -- the guard is broken")
         return 1
     print("\nself-test: the guard can fail, and comments/strings do not fool it")
     return 0
+
+
+# Benchmarks are executables too: they call n00b_init in their own main and
+# are registered as tests. Globbing only test_*.c let bench_rocs_catalog_rewrite
+# and bench_rocs_retention_pinned ship without n00b_shutdown, and the first
+# crashed main's Windows lane with an access violation during exit teardown.
+CANDIDATE_GLOBS = ("test_*.c", "bench_*.c")
+
+
+def candidate_files(directory: Path) -> list:
+    return sorted({f for g in CANDIDATE_GLOBS for f in directory.glob(g)})
 
 
 def main() -> int:
@@ -240,7 +263,7 @@ def main() -> int:
     if args.self_test:
         return self_test()
 
-    files = sorted(TEST_DIR.glob("test_*.c"))
+    files = candidate_files(TEST_DIR)
     if not files:
         print(f"ERROR: no tests found under {TEST_DIR}", file=sys.stderr)
         return 1
@@ -267,7 +290,7 @@ def main() -> int:
     if new or fixed:
         return 1
 
-    print(f"ok: {len(files)} tests checked, "
+    print(f"ok: {len(files)} tests and benches checked, "
           f"{len(ALLOWLIST)} known offenders remaining (n00b#527 debt)")
     return 0
 
