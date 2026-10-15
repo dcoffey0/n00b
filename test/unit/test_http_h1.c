@@ -429,6 +429,52 @@ test_request_build_query_default_path(void)
 }
 
 static void
+test_request_build_long_header_kept_whole(void)
+{
+    /* A WorkOS bearer token is ~1.3 KB. Header lines used to be cut at
+     * 1023 bytes, losing the CRLF, which left a malformed request that
+     * servers stalled on. */
+    static char value[2048];
+    memcpy(value, "Bearer ", 7);
+    memset(value + 7, 'a', sizeof(value) - 8);
+    value[sizeof(value) - 1] = '\0';
+
+    static char expected[2200];
+    snprintf(expected, sizeof(expected), "authorization: %s\r\n", value);
+
+    n00b_http_h1_headers_t *extra = n00b_http_h1_headers_new();
+    n00b_http_h1_headers_set(extra, "Authorization", value);
+    n00b_http_h1_headers_set(extra, "X-After", "still-here");
+    n00b_buffer_t *r = n00b_http_h1_request_build(
+        URL("https://example.com/v1/token/exchange"),
+        .method       = "POST",
+        .body         = Bcstr("{}"),
+        .content_type = "application/json",
+        .extra        = extra);
+    assert(buf_contains(r, expected));
+    assert(buf_contains(r, "x-after: still-here\r\n"));
+    assert(buf_contains(r, "\r\n\r\n{}"));
+    printf("  [PASS] a header over 1 KB is sent whole, with its CRLF\n");
+}
+
+static void
+test_request_build_long_request_line_kept_whole(void)
+{
+    static char url[1600];
+    static char line[1700];
+    char        query[1400];
+    memset(query, 'q', sizeof(query) - 1);
+    query[sizeof(query) - 1] = '\0';
+    snprintf(url, sizeof(url), "https://example.com/search?k=%s", query);
+    snprintf(line, sizeof(line), "GET /search?k=%s HTTP/1.1\r\n", query);
+
+    n00b_buffer_t *r = n00b_http_h1_request_build(URL(url));
+    assert(buf_contains(r, line));
+    assert(buf_contains(r, "Host: example.com\r\n"));
+    printf("  [PASS] a request line over 1 KB is sent whole\n");
+}
+
+static void
 test_headers_iteration(void)
 {
     static const char raw[] =
@@ -479,6 +525,8 @@ main(int argc, char **argv)
     test_request_build_ipv6_default_port();
     test_request_build_extra_overrides_builtin();
     test_request_build_query_default_path();
+    test_request_build_long_header_kept_whole();
+    test_request_build_long_request_line_kept_whole();
     printf("All test_http_h1 tests passed.\n");
 
     n00b_shutdown();

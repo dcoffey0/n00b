@@ -533,17 +533,36 @@ append_cstr(n00b_buffer_t *out, const char *s, n00b_allocator_t *a)
     n00b_buffer_concat(out, piece);
 }
 
+// Formats one request line or header line. Most fit the stack buffer; a
+// longer one (a bearer token is often over 1 KB, and so is a long query) is
+// formatted again into a buffer of its own size. Truncating it instead would
+// also drop the line's CRLF and leave a malformed request.
 static void
 append_fmt(n00b_buffer_t *out, n00b_allocator_t *a, const char *fmt, ...)
 {
     char    line[1024];
     va_list ap;
+    va_list again;
     va_start(ap, fmt);
+    va_copy(again, ap);
     int n = vsnprintf(line, sizeof(line), fmt, ap);
     va_end(ap);
-    if (n <= 0) return;
-    if ((size_t)n >= sizeof(line)) n = (int)sizeof(line) - 1;
-    n00b_buffer_t *piece = n00b_buffer_from_bytes(line, (int64_t)n,
+    if (n <= 0) {
+        va_end(again);
+        return;
+    }
+    char *text = line;
+    if ((size_t)n >= sizeof(line)) {
+        text = n00b_alloc_array_with_opts(char,
+                                          (int64_t)n + 1,
+                                          &(n00b_alloc_opts_t){
+                                              .allocator = a,
+                                              .no_scan   = true,
+                                          });
+        (void)vsnprintf(text, (size_t)n + 1, fmt, again);
+    }
+    va_end(again);
+    n00b_buffer_t *piece = n00b_buffer_from_bytes(text, (int64_t)n,
                                                    .allocator = a);
     n00b_buffer_concat(out, piece);
 }
