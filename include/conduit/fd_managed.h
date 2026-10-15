@@ -338,6 +338,7 @@ struct n00b_conduit_fd_owner {
     _Atomic(bool)                read_active;    /**< True if reads activated */
     _Atomic(bool)                write_active;   /**< True if writes activated */
     _Atomic(bool)                write_draining; /**< True while a writer drains wq */
+    _Atomic(bool)                read_again;     /**< A read pass was asked for while another held the read claim */
     _Atomic(bool)                registry_registered; /**< True while in c->fd_owners */
     _Atomic(bool)                native_released; /**< True after owned FD was released */
     _Atomic(uint64_t)            close_generation; /**< 0 until teardown starts */
@@ -696,6 +697,15 @@ n00b_conduit_fd_owner_flush(n00b_conduit_fd_owner_t *owner, int32_t timeout_ms);
  */
 extern void
 n00b_conduit_fd_owner_hold_writes(bool hold);
+
+/**
+ * @brief Test-only: called at the end of each read pass, after the last
+ *        read and before the pass gives up its claim on the read topic.
+ *
+ * The window between those two is where a read pass on another thread can
+ * fail to claim, so a test can widen it deterministically.
+ */
+extern void (*n00b_fd_owner_read_pass_end_hook)(n00b_conduit_fd_owner_t *owner);
 #endif
 
 /**
