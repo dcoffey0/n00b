@@ -120,8 +120,10 @@ test_string_alloc_site_proxy(void)
     assert(s->data != nullptr);
     assert(!strcmp(s->data, "attributed-string"));
 
-    n00b_alloc_info_t sinfo = n00b_find_alloc_info(s);
-    n00b_alloc_info_t dinfo = n00b_find_alloc_info(s->data);
+    bool              spin  = false;
+    bool              dpin  = false;
+    n00b_alloc_info_t sinfo = n00b_find_alloc_info(s, .pin = &spin);
+    n00b_alloc_info_t dinfo = n00b_find_alloc_info(s->data, .pin = &dpin);
     assert(sinfo.kind == n00b_alloc_oob);
     assert(dinfo.kind == n00b_alloc_oob);
     assert(sinfo.hdr.oob->file_name != nullptr);
@@ -133,6 +135,8 @@ test_string_alloc_site_proxy(void)
     assert(strstr(dinfo.hdr.oob->file_name,
                   "test_string_scratch_raw_worker.c") != nullptr);
 #endif
+    n00b_alloc_hdr_unpin(dpin);
+    n00b_alloc_hdr_unpin(spin);
 
     printf("  [PASS] string_alloc_site_proxy\n");
 }

@@ -45,8 +45,11 @@ static int failures = 0;
 static void
 check_interior(uint8_t *base, n00b_alloc_info_t base_info, size_t off)
 {
+    bool              pin = false;
     n00b_alloc_info_t got = n00b_find_alloc_info(base + off,
-                                                 .scan_for_header = true);
+                                                 .scan_for_header = true,
+                                                 .pin             = &pin);
+    n00b_alloc_hdr_unpin(pin);
 
     if (!n00b_alloc_info_is_heap(got)) {
         printf("  [FAIL] interior +%-12zu B (%6.2f MB): unresolved (kind=%d)"
@@ -89,7 +92,9 @@ main(int argc, char **argv)
     memset(p, 0xA5, BIG_ALLOC_BYTES);
 
     /* The base must resolve exactly, or the rest of the test proves nothing. */
-    n00b_alloc_info_t base_info = n00b_find_alloc_info(p);
+    bool              base_pin  = false;
+    n00b_alloc_info_t base_info = n00b_find_alloc_info(p, .pin = &base_pin);
+    n00b_alloc_hdr_unpin(base_pin);
     assert(n00b_alloc_info_is_heap(base_info));
 
     /* The guard back-scan only runs when the allocator writes inline headers,
@@ -120,8 +125,11 @@ main(int argc, char **argv)
     /* A pointer into a segment but NOT into any live allocation must still be
      * rejected -- the bound must not have been "fixed" by making the scan
      * accept anything it happens to land on. */
-    n00b_alloc_info_t bogus = n00b_find_alloc_info((void *)((uintptr_t)p - 64),
-                                                   .scan_for_header = true);
+    bool              bogus_pin = false;
+    n00b_alloc_info_t bogus     = n00b_find_alloc_info((void *)((uintptr_t)p - 64),
+                                                       .scan_for_header = true,
+                                                       .pin             = &bogus_pin);
+    n00b_alloc_hdr_unpin(bogus_pin);
     if (n00b_alloc_info_is_heap(bogus)
         && bogus.kind == base_info.kind
         && bogus.hdr.in_line == base_info.hdr.in_line) {

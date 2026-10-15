@@ -668,10 +668,50 @@ n00b_store_index_hot_skew_count(n00b_store_index_t *index,
 #endif
 
 /**
- * @brief Add an ordinal to a posting list, keeping it ascending.
+ * @brief Build an empty posting list in @p allocator.
  *
- * The single implementation of that invariant; readers binary-search these
- * lists.
+ * Neither representation carries a lock: a list has one writer, and readers
+ * run lock-free against it (see rocs_posting_list_push).
+ */
+extern n00b_store_posting_list_t *
+rocs_posting_list_new() _kargs
+{
+    n00b_store_postings_kind_t kind      = N00B_STORE_POSTINGS_SPARSE;
+    n00b_allocator_t          *allocator = nullptr;
+};
+
+#ifdef N00B_DEBUG
+/**
+ * @brief Claim, and release, the right to push into a shard's posting lists.
+ *
+ * Debug-only. Aborts when a second thread claims a shard another thread holds,
+ * which is the one arrangement the lock-free posting lists cannot survive.
+ */
+extern void rocs_index_writer_enter(n00b_store_shard_t *shard);
+extern void rocs_index_writer_exit(n00b_store_shard_t *shard);
+
+/**
+ * @brief Park a hot posting-list reader between its length loads and its
+ *        element reads, for a test that grows the list in that window.
+ */
+typedef void (*rocs_posting_read_hook_t)(n00b_store_posting_list_t *postings,
+                                         void                      *ctx);
+extern void rocs_posting_read_hook_set(rocs_posting_read_hook_t hook,
+                                       void                    *ctx);
+#else
+#define rocs_index_writer_enter(shard) ((void)(shard))
+#define rocs_index_writer_exit(shard)  ((void)(shard))
+#endif
+
+/**
+ * @brief Add an ordinal to a posting list.
+ *
+ * The list's only writer: the caller holds the shard's writer claim, which
+ * store ingest gets from commit_lock and n00b_store_index_add callers get by
+ * not overlapping on a shard. Readers take no lock. The element or bit is
+ * written first and the length is release-stored after it, and growth
+ * publishes the copied array before the length and never frees the old one,
+ * so a reader that acquires a length finds that many elements behind it.
  *
  * @param postings Borrowed posting list.
  * @param ordinal  Record ordinal to add.

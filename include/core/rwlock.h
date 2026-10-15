@@ -69,6 +69,24 @@ extern void _n00b_rw_read_lock(n00b_rwlock_t *, char *);
  */
 extern bool _n00b_rw_unlock(n00b_rwlock_t *, char *);
 
+#ifdef N00B_DEBUG
+/**
+ * @brief Debug-only: the calling thread's count of rwlock write releases,
+ *        each of which wakes the futex.
+ */
+extern uint64_t n00b_rw_debug_write_wakes(void);
+
+/**
+ * @brief Debug-only: the calling thread's count of rwlock read acquisitions.
+ */
+extern uint64_t n00b_rw_debug_read_acquires(void);
+
+/**
+ * @brief Debug-only: the calling thread's count of rwlock write acquisitions.
+ */
+extern uint64_t n00b_rw_debug_write_acquires(void);
+#endif
+
 /**
  * @brief Adopt a record-less reader hold (taken null-self, e.g. at the start of
  *        thread init before the TCB exists) into a TCB read-log record, so that
@@ -79,6 +97,14 @@ extern bool _n00b_rw_unlock(n00b_rwlock_t *, char *);
  * @param thread The holding thread (must have a resolvable ->record).
  */
 extern void n00b_rw_adopt_read_hold(n00b_rwlock_t *lock, n00b_thread_t *thread);
+
+/**
+ * @brief True if the calling thread holds @p lock, for read or for write.
+ *
+ * Read holds are found through the thread's read log, so a thread without a
+ * TCB, whose read holds are untracked, gets false for a read hold.
+ */
+extern bool n00b_rw_held_by_self(n00b_rwlock_t *lock);
 
 /**
  * @brief Drop one reader unit from a rwlock futex, with an underflow guard.
