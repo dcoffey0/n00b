@@ -7,6 +7,7 @@
 #include "conduit/print.h"
 #include "parsers/json.h"
 #include "rocs/shard.h"
+#include "internal/rocs/index.h"
 #include "util/marshal.h"
 
 #include <string.h>
@@ -133,19 +134,26 @@ typedef struct {
 static void
 rocs_apply_struct_field_scan(void *ptr, const n00b_gc_struct_array_t *shape)
 {
-    n00b_alloc_info_t ai = n00b_find_alloc_info(ptr, .scan_for_header = true);
+    bool              pin = false;
+    n00b_alloc_info_t ai  = n00b_find_alloc_info(ptr,
+                                                 .scan_for_header = true,
+                                                 .pin             = &pin);
     if (ai.kind == n00b_alloc_inline && ai.hdr.in_line != nullptr) {
         ai.hdr.in_line->scan_kind = N00B_GC_SCAN_KIND_CALLBACK;
         ai.hdr.in_line->scan_cb   = n00b_gc_scan_cb_struct_field;
         ai.hdr.in_line->scan_user = (void *)shape;
     }
+    n00b_alloc_hdr_unpin(pin);
 }
 
 static void
 rocs_apply_scan_kind(void *ptr, n00b_gc_scan_kind_t scan_kind)
 {
-    n00b_alloc_info_t ai = n00b_find_alloc_info(ptr, .scan_for_header = true);
-    bool no_scan = scan_kind == N00B_GC_SCAN_KIND_NONE;
+    bool              pin     = false;
+    n00b_alloc_info_t ai      = n00b_find_alloc_info(ptr,
+                                                     .scan_for_header = true,
+                                                     .pin             = &pin);
+    bool              no_scan = scan_kind == N00B_GC_SCAN_KIND_NONE;
     if (ai.kind == n00b_alloc_inline && ai.hdr.in_line != nullptr) {
         ai.hdr.in_line->scan_kind = scan_kind;
         ai.hdr.in_line->no_scan   = no_scan;
@@ -158,6 +166,7 @@ rocs_apply_scan_kind(void *ptr, n00b_gc_scan_kind_t scan_kind)
         ai.hdr.oob->scan_cb   = nullptr;
         ai.hdr.oob->scan_user = nullptr;
     }
+    n00b_alloc_hdr_unpin(pin);
 }
 
 static void
@@ -339,6 +348,7 @@ rocs_shard_scrub_process_metadata(n00b_store_shard_t *shard,
                                                          postings->ordinals);
                 }
                 else {
+                    n00b_flagset_trim(postings->flags);
                     n00b_atomic_store(
                         &postings->count,
                         postings->flags == nullptr
@@ -413,15 +423,10 @@ rocs_shard_record_list_new() _kargs
                              });
     rocs_apply_struct_field_scan(records, &rocs_list_data_pointer_shape);
 
-    // The store synchronizes its writers through an rwlock, but the list is
-    // built unlocked and the lock installed separately, below. Pre-size to the
-    // shard's record ceiling (record_cap, from the seal policy's max_records)
-    // so the backing array is allocated once and never reallocs as records are
-    // appended. That matters for more than correctness: an un-sized list copies
-    // its whole backing array on every grow, and that memcpy runs under the
-    // write lock, so on a busy hot shard readers stall behind repeated 2 MB
-    // reallocs. Sized once, each append holds the write lock only briefly, and
-    // published (write-once) slots never move.
+    // No lock: the list has one writer and lock-free readers (see
+    // rocs_shard_records_push). Pre-size to the shard's record ceiling
+    // (record_cap, from the seal policy's max_records) so the backing array is
+    // allocated once and growth leaves no outgrown copies behind.
     if (record_cap > 0) {
         *records = n00b_list_new_cap_private(n00b_string_t *,
                                              record_cap,
@@ -434,19 +439,84 @@ rocs_shard_record_list_new() _kargs
                                          .scan_kind = N00B_GC_SCAN_KIND_ALL);
     }
 
-    // The lock must not live in a collected heap. rocs_list_data_pointer_shape
-    // marks word 0 (the data pointer) as this struct's only pointer word, so a
-    // lock allocated alongside the list data would be neither kept alive nor
-    // forwarded by a collect, and the field would dangle into unmapped
-    // from-space. n00b_data_lock_new with no allocator targets the runtime
-    // system pool, which is hidden from the GC and never moves.
-    records->lock = n00b_data_lock_new();
-    n00b_lock_set_debug_name(records->lock, "rocs shard records");
-    // Outside any posting list, so it ranks above one: a thread holding this
-    // may take a posting lock, and the reverse is the inversion.
-    n00b_lock_set_rank(records->lock, N00B_LOCK_RANK_SHARD);
-
     return records;
+}
+
+// A hot shard's record list has one writer, the appender, which for a store is
+// whoever holds commit_lock. Debug builds abort on a second one. Readers take
+// no lock: they acquire the length, then the array, then the slot, so a reader
+// that sees a length also sees an array that long, and a filled slot's text.
+// Growth leaves the outgrown array where it is, because a reader may still
+// hold it and the shard pool zeroes a freed slot for reuse. It goes back with
+// the pool when the shard retires.
+static void
+rocs_shard_records_push(n00b_store_shard_t *shard, n00b_string_t *text)
+{
+    rocs_index_writer_enter(shard);
+    n00b_store_record_payload_list_t *records = shard->records;
+    size_t                            len     = records->len;
+    if (len + 1 > records->cap) {
+        size_t          cap   = n00b_align_closest_pow2_ceil(
+            n00b_max(len + 1, records->cap * 2));
+        n00b_string_t **grown = n00b_alloc_array_with_opts(
+            n00b_string_t *,
+            cap,
+            &(n00b_alloc_opts_t){.allocator = records->allocator,
+                                 .scan_kind = records->scan_kind,
+                                 .scan_cb   = records->scan_cb,
+                                 .scan_user = records->scan_user});
+        if (len != 0) {
+            memcpy(grown, records->data, len * sizeof(n00b_string_t *));
+        }
+        __atomic_store_n(&records->data, grown, __ATOMIC_RELEASE);
+        records->cap = cap;
+    }
+    __atomic_store_n(&records->data[len], text, __ATOMIC_RELEASE);
+    __atomic_store_n(&records->len, len + 1, __ATOMIC_RELEASE);
+    rocs_index_writer_exit(shard);
+}
+
+static void
+rocs_shard_records_fill(n00b_store_shard_t *shard,
+                        uint64_t            ordinal,
+                        n00b_string_t      *text)
+{
+    rocs_index_writer_enter(shard);
+    __atomic_store_n(&shard->records->data[ordinal], text, __ATOMIC_RELEASE);
+    rocs_index_writer_exit(shard);
+}
+
+static void
+rocs_shard_records_drop_tail(n00b_store_shard_t *shard, uint64_t count)
+{
+    rocs_index_writer_enter(shard);
+    size_t len = shard->records->len - (size_t)count;
+    __atomic_store_n(&shard->records->len, len, __ATOMIC_RELEASE);
+    rocs_index_writer_exit(shard);
+}
+
+uint64_t
+n00b_store_shard_records_len(n00b_store_shard_t *shard)
+{
+    if (shard == nullptr || shard->records == nullptr) {
+        return 0;
+    }
+    return (uint64_t)__atomic_load_n(&shard->records->len, __ATOMIC_ACQUIRE);
+}
+
+n00b_string_t *
+n00b_store_shard_record_at(n00b_store_shard_t *shard, uint64_t ordinal)
+{
+    if (shard == nullptr || shard->records == nullptr) {
+        return nullptr;
+    }
+    n00b_store_record_payload_list_t *records = shard->records;
+    size_t len = __atomic_load_n(&records->len, __ATOMIC_ACQUIRE);
+    if (ordinal >= (uint64_t)len) {
+        return nullptr;
+    }
+    n00b_string_t **data = __atomic_load_n(&records->data, __ATOMIC_ACQUIRE);
+    return __atomic_load_n(&data[ordinal], __ATOMIC_ACQUIRE);
 }
 
 static n00b_store_raw_list_t *
@@ -966,13 +1036,16 @@ n00b_store_shard_new() _kargs
     // on this shard's inline header so the marshal scans only the 4 pointer
     // words and not the scalar byte_estimate.  Marshal/GC read scan_cb from the
     // inline header; only this object is affected.
-    n00b_alloc_info_t shard_ai = n00b_find_alloc_info(shard,
-                                                      .scan_for_header = true);
+    bool              shard_pin = false;
+    n00b_alloc_info_t shard_ai  = n00b_find_alloc_info(shard,
+                                                       .scan_for_header = true,
+                                                       .pin             = &shard_pin);
     if (shard_ai.kind == n00b_alloc_inline && shard_ai.hdr.in_line != nullptr) {
         shard_ai.hdr.in_line->scan_kind = N00B_GC_SCAN_KIND_CALLBACK;
         shard_ai.hdr.in_line->scan_cb   = n00b_gc_scan_cb_struct_field;
         shard_ai.hdr.in_line->scan_user = (void *)&rocs_shard_pointer_prefix_shape;
     }
+    n00b_alloc_hdr_unpin(shard_pin);
 
     shard->records       = rocs_shard_record_list_new(.allocator  = allocator,
                                                        .record_cap = record_cap);
@@ -1033,7 +1106,7 @@ n00b_store_shard_reserve(n00b_store_shard_t *shard,
     if (UINT64_MAX - shard->record_count < count) {
         return n00b_result_err(uint64_t, N00B_STORE_SHARD_ERR_ARG);
     }
-    if (shard->record_count != (uint64_t)n00b_list_len(*shard->records)) {
+    if (shard->record_count != (uint64_t)shard->records->len) {
         return n00b_result_err(uint64_t, N00B_STORE_SHARD_ERR_STATE);
     }
     if (shard->retain_raw != nullptr
@@ -1042,7 +1115,7 @@ n00b_store_shard_reserve(n00b_store_shard_t *shard,
     }
     uint64_t start = shard->record_count;
     for (uint64_t i = 0; i < count; i++) {
-        n00b_list_push(*shard->records, nullptr);
+        rocs_shard_records_push(shard, nullptr);
         if (shard->retain_raw != nullptr) {
             n00b_list_push(*shard->retain_raw, nullptr);
         }
@@ -1115,7 +1188,7 @@ n00b_store_shard_fill_reserved(n00b_store_shard_t *shard,
             .allocator = shard->retain_raw->allocator);
     }
 
-    n00b_list_set(*shard->records, (size_t)ordinal, record_text);
+    rocs_shard_records_fill(shard, ordinal, record_text);
     if (shard->retain_raw != nullptr) {
         n00b_list_set(*shard->retain_raw, (size_t)ordinal, raw_span);
     }
@@ -1274,7 +1347,7 @@ n00b_store_shard_fill_prepared_reserved(
         return n00b_result_err(bool, N00B_STORE_SHARD_ERR_ARG);
     }
 
-    n00b_list_set(*shard->records, (size_t)ordinal, prepared->record_text);
+    rocs_shard_records_fill(shard, ordinal, prepared->record_text);
     if (shard->retain_raw != nullptr) {
         n00b_list_set(*shard->retain_raw, (size_t)ordinal, prepared->raw_span);
     }
@@ -1319,11 +1392,9 @@ n00b_store_shard_cancel_tail_reservation(n00b_store_shard_t *shard,
         }
     }
 
-    for (uint64_t i = 0; i < count; i++) {
-        (void)n00b_list_pop(n00b_string_t *, *shard->records);
-        if (shard->retain_raw != nullptr) {
-            (void)n00b_list_pop(n00b_store_raw_span_t *, *shard->retain_raw);
-        }
+    rocs_shard_records_drop_tail(shard, count);
+    for (uint64_t i = 0; shard->retain_raw != nullptr && i < count; i++) {
+        (void)n00b_list_pop(n00b_store_raw_span_t *, *shard->retain_raw);
     }
     shard->record_count -= count;
 

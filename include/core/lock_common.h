@@ -66,11 +66,6 @@ struct n00b_lock_base_t {
  */
 typedef enum : uint8_t {
     N00B_LOCK_RANK_NONE = 0,
-    // A shard, then one posting list inside that shard, then the flag set
-    // inside that posting list.
-    N00B_LOCK_RANK_SHARD = 20,
-    N00B_LOCK_RANK_POSTINGS = 30,
-    N00B_LOCK_RANK_FLAGSET = 40,
 } n00b_lock_rank_t;
 
 enum {

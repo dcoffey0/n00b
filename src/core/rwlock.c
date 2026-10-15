@@ -150,6 +150,20 @@ n00b_rw_adopt_read_hold(n00b_rwlock_t *lock, n00b_thread_t *thread)
     // Read-lock accounting is a no-op in this build regardless (lock_accounting.c).
 }
 
+bool
+n00b_rw_held_by_self(n00b_rwlock_t *lock)
+{
+    n00b_thread_t *thread = n00b_thread_self();
+
+    if (n00b_atomic_load(&lock->data).owner == n00b_thread_os_id(thread)) {
+        return true;
+    }
+    if (thread == nullptr || thread->record == nullptr) {
+        return false;
+    }
+    return find_read_lock_record(lock, thread) != nullptr;
+}
+
 int
 _n00b_rw_write_lock(n00b_rwlock_t *lock, char *loc)
 {
@@ -161,6 +175,11 @@ _n00b_rw_write_lock(n00b_rwlock_t *lock, char *loc)
 
     n00b_thread_t          *thread    = n00b_thread_self();
     int64_t                 tid       = n00b_thread_os_id(thread);
+#ifdef N00B_DEBUG
+    if (thread != nullptr && thread->record != nullptr) {
+        thread->record->debug_rw_write_acquires++;
+    }
+#endif
     n00b_core_lock_info_t   info      = n00b_atomic_load(&lock->data);
     // No TCB => no read record to upgrade from (find_read_lock_record derefs
     // thread->record).  The only write-locker is the STW collector, which
@@ -252,6 +271,11 @@ _n00b_rw_read_lock(n00b_rwlock_t *lock, char *loc)
     // already torn down); find_read_lock_record / register_read deref the
     // record, so treat that window like null-self too.
     bool have_tcb = (thread != nullptr && thread->record != nullptr);
+#ifdef N00B_DEBUG
+    if (have_tcb) {
+        thread->record->debug_rw_read_acquires++;
+    }
+#endif
 
     // n00b#521: a TCB-less reader is permitted on ANY lock, not just the STW
     // gate. A thread n00b did not create -- Windows' KERNELBASE!CtrlRoutine,
@@ -388,6 +412,35 @@ _n00b_rw_drop_reader_unit(n00b_rwlock_t *lock)
     return desired;
 }
 
+#ifdef N00B_DEBUG
+uint64_t
+n00b_rw_debug_write_wakes(void)
+{
+    n00b_thread_t *thread = n00b_thread_self();
+    return thread != nullptr && thread->record != nullptr
+             ? thread->record->debug_rw_write_wakes
+             : 0;
+}
+
+uint64_t
+n00b_rw_debug_read_acquires(void)
+{
+    n00b_thread_t *thread = n00b_thread_self();
+    return thread != nullptr && thread->record != nullptr
+             ? thread->record->debug_rw_read_acquires
+             : 0;
+}
+
+uint64_t
+n00b_rw_debug_write_acquires(void)
+{
+    n00b_thread_t *thread = n00b_thread_self();
+    return thread != nullptr && thread->record != nullptr
+             ? thread->record->debug_rw_write_acquires
+             : 0;
+}
+#endif
+
 bool
 _n00b_rw_unlock(n00b_rwlock_t *lock, char *loc)
 {
@@ -412,6 +465,11 @@ _n00b_rw_unlock(n00b_rwlock_t *lock, char *loc)
         }
         n00b_atomic_and(&lock->futex, ~N00B_RW_W_LOCK);
         n00b_futex_wake(&lock->futex, true);
+#ifdef N00B_DEBUG
+        if (thread != nullptr && thread->record != nullptr) {
+            thread->record->debug_rw_write_wakes++;
+        }
+#endif
 
         return true;
     }

@@ -20,42 +20,68 @@ flagset_tail_mask(uint64_t bits)
     return (1ull << rem) - 1ull;
 }
 
+// Words that hold bits below num_flags. The array may run past this: growth
+// doubles it, and every word beyond the used ones stays zero.
+static uint64_t
+flagset_used_words(const n00b_flagset_t *self)
+{
+    return n00b_min(flagset_words_for_bits(self->num_flags),
+                    self->alloc_wordlen);
+}
+
 static void
 flagset_zero_tail(n00b_flagset_t *self)
 {
     if (self == nullptr || self->contents == nullptr || self->alloc_wordlen == 0) {
         return;
     }
-    self->contents[self->alloc_wordlen - 1] &= flagset_tail_mask(self->num_flags);
+    self->contents[flagset_used_words(self) - 1]
+        &= flagset_tail_mask(self->num_flags);
 }
 
+static void
+flagset_realloc(n00b_flagset_t *self, uint64_t new_words)
+{
+    // The bit array is pure data (membership bits), never pointers, so it
+    // MUST be no-scan: otherwise the conservative scan / marshaler reads
+    // bitmap words as candidate pointers, which (e.g. when a flagset-backed
+    // dense posting list is marshaled at rocs seal) misfires as an
+    // unregistered-static-pointer and fails the whole marshal.  The typed
+    // (uint64_t) alloc already yields a scalar GC map; .scan_kind=NONE is
+    // explicit belt-and-suspenders.
+    uint64_t *contents = n00b_alloc_array_with_opts(
+        uint64_t,
+        new_words,
+        &(n00b_alloc_opts_t){.allocator = self->allocator,
+                             .scan_kind = N00B_GC_SCAN_KIND_NONE});
+    memset(contents, 0, new_words * sizeof(uint64_t));
+    uint64_t copy_words = n00b_min(self->alloc_wordlen, new_words);
+    if (copy_words != 0 && self->contents != nullptr) {
+        memcpy(contents, self->contents, copy_words * sizeof(uint64_t));
+    }
+    if (self->contents != nullptr) {
+        n00b_free(self->contents);
+    }
+    self->contents      = contents;
+    self->alloc_wordlen = new_words;
+}
+
+// Growth at least doubles the array, so setting bits 0..n-1 in order costs
+// O(log n) reallocations and O(n) words copied in total.
 static void
 flagset_resize(n00b_flagset_t *self, uint64_t new_num_flags)
 {
     uint64_t new_words = flagset_words_for_bits(new_num_flags);
-    if (new_words != self->alloc_wordlen) {
-        // The bit array is pure data (membership bits), never pointers, so it
-        // MUST be no-scan: otherwise the conservative scan / marshaler reads
-        // bitmap words as candidate pointers, which (e.g. when a flagset-backed
-        // dense posting list is marshaled at rocs seal) misfires as an
-        // unregistered-static-pointer and fails the whole marshal.  The typed
-        // (uint64_t) alloc already yields a scalar GC map; .scan_kind=NONE is
-        // explicit belt-and-suspenders.
-        uint64_t *contents = n00b_alloc_array_with_opts(
-            uint64_t,
-            new_words,
-            &(n00b_alloc_opts_t){.allocator = self->allocator,
-                                 .scan_kind = N00B_GC_SCAN_KIND_NONE});
-        memset(contents, 0, new_words * sizeof(uint64_t));
-        uint64_t copy_words = n00b_min(self->alloc_wordlen, new_words);
-        if (copy_words != 0 && self->contents != nullptr) {
-            memcpy(contents, self->contents, copy_words * sizeof(uint64_t));
+    if (new_words > self->alloc_wordlen) {
+        flagset_realloc(self, n00b_max(new_words, self->alloc_wordlen * 2));
+    }
+    else if (new_num_flags < self->num_flags) {
+        uint64_t old_words = flagset_used_words(self);
+        if (old_words > new_words) {
+            memset(self->contents + new_words,
+                   0,
+                   (old_words - new_words) * sizeof(uint64_t));
         }
-        if (self->contents != nullptr) {
-            n00b_free(self->contents);
-        }
-        self->contents      = contents;
-        self->alloc_wordlen = new_words;
     }
 
     self->num_flags = new_num_flags;
@@ -117,6 +143,78 @@ n00b_flagset_init(n00b_flagset_t *self) _kargs
     flagset_resize(self, length);
 }
 
+// Single writer, lock-free readers. Contents are published before the length
+// fields, and n00b_flagset_view loads them in the opposite order, so a reader
+// that sees a length also sees an array at least that long. A grown-out array
+// is never freed, because a reader may still be walking it; it goes back to
+// the allocator with everything else the set's pool holds.
+bool
+n00b_flagset_set_owned(n00b_flagset_t *self, uint64_t index)
+{
+    n00b_assert(self != nullptr && self->lock == nullptr);
+
+    uint64_t  num_flags = __atomic_load_n(&self->num_flags, __ATOMIC_RELAXED);
+    uint64_t *words     = __atomic_load_n(&self->contents, __ATOMIC_RELAXED);
+    uint64_t  wordlen   = __atomic_load_n(&self->alloc_wordlen, __ATOMIC_RELAXED);
+
+    if (index >= num_flags) {
+        uint64_t need = flagset_words_for_bits(index + 1);
+        if (need > wordlen) {
+            uint64_t  grown_len = n00b_max(need, wordlen * 2);
+            uint64_t *grown     = n00b_alloc_array_with_opts(
+                uint64_t,
+                grown_len,
+                &(n00b_alloc_opts_t){.allocator = self->allocator,
+                                     .scan_kind = N00B_GC_SCAN_KIND_NONE});
+            memset(grown, 0, grown_len * sizeof(uint64_t));
+            if (words != nullptr && wordlen != 0) {
+                memcpy(grown, words, wordlen * sizeof(uint64_t));
+            }
+            __atomic_store_n(&self->contents, grown, __ATOMIC_RELEASE);
+            __atomic_store_n(&self->alloc_wordlen, grown_len, __ATOMIC_RELEASE);
+            words = grown;
+        }
+    }
+
+    uint64_t *slot  = &words[index >> 6];
+    uint64_t  bit   = 1ull << (index & 63u);
+    uint64_t  word  = __atomic_load_n(slot, __ATOMIC_RELAXED);
+    bool      fresh = (word & bit) == 0;
+    if (fresh) {
+        __atomic_store_n(slot, word | bit, __ATOMIC_RELAXED);
+    }
+    if (index >= num_flags) {
+        __atomic_store_n(&self->num_flags, index + 1, __ATOMIC_RELEASE);
+    }
+    return fresh;
+}
+
+void
+n00b_flagset_view(const n00b_flagset_t *self,
+                  const uint64_t      **words,
+                  uint64_t             *wordlen)
+{
+    uint64_t bits = __atomic_load_n(&self->num_flags, __ATOMIC_ACQUIRE);
+    *words        = __atomic_load_n(&self->contents, __ATOMIC_ACQUIRE);
+    *wordlen      = (bits + 63u) / 64u;
+}
+
+// Release the doubling slack, so an image marshaled from the set carries only
+// the words that hold bits.
+void
+n00b_flagset_trim(n00b_flagset_t *self)
+{
+    if (self == nullptr) {
+        return;
+    }
+    n00b_data_write_lock(self->lock);
+    uint64_t used = flagset_used_words(self);
+    if (self->contents != nullptr && self->alloc_wordlen > used) {
+        flagset_realloc(self, used);
+    }
+    n00b_data_unlock(self->lock);
+}
+
 n00b_flagset_t *
 n00b_flagset_copy(const n00b_flagset_t *self)
 {
@@ -129,7 +227,7 @@ n00b_flagset_copy(const n00b_flagset_t *self)
                          .allocator = self->allocator);
     memcpy(result->contents,
            self->contents,
-           self->alloc_wordlen * sizeof(uint64_t));
+           flagset_used_words(self) * sizeof(uint64_t));
     n00b_data_unlock(self->lock);
     return result;
 }
@@ -142,7 +240,7 @@ n00b_flagset_invert(const n00b_flagset_t *self)
         return nullptr;
     }
 
-    for (uint64_t i = 0; i < result->alloc_wordlen; i++) {
+    for (uint64_t i = 0; i < flagset_used_words(result); i++) {
         result->contents[i] = ~result->contents[i];
     }
     flagset_zero_tail(result);
@@ -181,12 +279,14 @@ n00b_flagset_add(const n00b_flagset_t *self, const n00b_flagset_t *with)
         return nullptr;
     }
 
-    uint64_t min_words = n00b_min(self->alloc_wordlen, with->alloc_wordlen);
+    uint64_t self_words = flagset_used_words(self);
+    uint64_t with_words = flagset_used_words(with);
+    uint64_t min_words  = n00b_min(self_words, with_words);
     for (uint64_t i = 0; i < min_words; i++) {
         result->contents[i] = self->contents[i] | with->contents[i];
     }
-    for (uint64_t i = min_words; i < result->alloc_wordlen; i++) {
-        result->contents[i] = self->alloc_wordlen > with->alloc_wordlen
+    for (uint64_t i = min_words; i < flagset_used_words(result); i++) {
+        result->contents[i] = self_words > with_words
                                   ? self->contents[i]
                                   : with->contents[i];
     }
@@ -219,11 +319,13 @@ n00b_flagset_sub(const n00b_flagset_t *self, const n00b_flagset_t *with)
         return nullptr;
     }
 
-    uint64_t min_words = n00b_min(self->alloc_wordlen, with->alloc_wordlen);
+    uint64_t self_words = flagset_used_words(self);
+    uint64_t with_words = flagset_used_words(with);
+    uint64_t min_words  = n00b_min(self_words, with_words);
     for (uint64_t i = 0; i < min_words; i++) {
         result->contents[i] = self->contents[i] & ~with->contents[i];
     }
-    for (uint64_t i = min_words; i < self->alloc_wordlen; i++) {
+    for (uint64_t i = min_words; i < self_words; i++) {
         result->contents[i] = self->contents[i];
     }
     flagset_zero_tail(result);
@@ -255,7 +357,9 @@ n00b_flagset_test(const n00b_flagset_t *self, const n00b_flagset_t *with)
         return nullptr;
     }
 
-    uint64_t min_words = n00b_min(self->alloc_wordlen, with->alloc_wordlen);
+    uint64_t self_words = flagset_used_words(self);
+    uint64_t with_words = flagset_used_words(with);
+    uint64_t min_words  = n00b_min(self_words, with_words);
     for (uint64_t i = 0; i < min_words; i++) {
         result->contents[i] = self->contents[i] & with->contents[i];
     }
@@ -287,12 +391,14 @@ n00b_flagset_xor(const n00b_flagset_t *self, const n00b_flagset_t *with)
         return nullptr;
     }
 
-    uint64_t min_words = n00b_min(self->alloc_wordlen, with->alloc_wordlen);
+    uint64_t self_words = flagset_used_words(self);
+    uint64_t with_words = flagset_used_words(with);
+    uint64_t min_words  = n00b_min(self_words, with_words);
     for (uint64_t i = 0; i < min_words; i++) {
         result->contents[i] = self->contents[i] ^ with->contents[i];
     }
-    for (uint64_t i = min_words; i < result->alloc_wordlen; i++) {
-        result->contents[i] = self->alloc_wordlen > with->alloc_wordlen
+    for (uint64_t i = min_words; i < flagset_used_words(result); i++) {
+        result->contents[i] = self_words > with_words
                                   ? self->contents[i]
                                   : with->contents[i];
     }
@@ -317,15 +423,17 @@ n00b_flagset_eq(const n00b_flagset_t *self, const n00b_flagset_t *other)
         n00b_data_read_lock(other->lock);
     }
     uint64_t sum       = 0;
-    uint64_t low_words = n00b_min(self->alloc_wordlen, other->alloc_wordlen);
+    uint64_t self_words  = flagset_used_words(self);
+    uint64_t other_words = flagset_used_words(other);
+    uint64_t low_words   = n00b_min(self_words, other_words);
     for (uint64_t i = 0; i < low_words; i++) {
         sum |= self->contents[i] ^ other->contents[i];
     }
 
-    const n00b_flagset_t *high = self->alloc_wordlen > other->alloc_wordlen
+    const n00b_flagset_t *high = self_words > other_words
                                      ? self
                                      : other;
-    uint64_t high_words = n00b_max(self->alloc_wordlen, other->alloc_wordlen);
+    uint64_t high_words = n00b_max(self_words, other_words);
     for (uint64_t i = low_words; i < high_words; i++) {
         sum |= high->contents[i];
     }
@@ -456,7 +564,7 @@ n00b_flagset_count(const n00b_flagset_t *self)
 
     n00b_data_read_lock(self->lock);
     uint64_t count = 0;
-    for (uint64_t i = 0; i < self->alloc_wordlen; i++) {
+    for (uint64_t i = 0; i < flagset_used_words(self); i++) {
         count += (uint64_t)__builtin_popcountll(self->contents[i]);
     }
     n00b_data_unlock(self->lock);
@@ -494,7 +602,7 @@ n00b_flagset_next_set(const n00b_flagset_t *self,
         }
 
         word_ix++;
-        if (word_ix >= self->alloc_wordlen) {
+        if (word_ix >= flagset_used_words(self)) {
             n00b_data_unlock(self->lock);
             return false;
         }

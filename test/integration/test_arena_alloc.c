@@ -95,7 +95,9 @@ test_alloc_info(void)
 
     assert(p != nullptr);
 
-    n00b_alloc_info_t info = n00b_find_alloc_info(p);
+    bool              pin  = false;
+    n00b_alloc_info_t info = n00b_find_alloc_info(p, .pin = &pin);
+    n00b_alloc_hdr_unpin(pin);
     assert(info.kind != n00b_alloc_none);
 
     printf("  [PASS] alloc_info\n");

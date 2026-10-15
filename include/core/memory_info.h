@@ -163,10 +163,10 @@ n00b_value_is_likely_pointer(void *ptr)
 static inline bool
 n00b_in_heap(void *ptr)
 {
-    auto mmap_opt = n00b_mmap_by_address(ptr);
+    n00b_mmap_view_t view;
 
-    if (n00b_option_is_set(mmap_opt)) {
-        switch (n00b_option_get(mmap_opt)->kind) {
+    if (n00b_mmap_view_by_address(ptr, &view)) {
+        switch (view.kind) {
         case n00b_mmap_managed_segment:
         case n00b_mmap_sys_segment:
         case n00b_mmap_pool:
@@ -188,13 +188,9 @@ n00b_in_heap(void *ptr)
 static inline bool
 n00b_in_stack(void *ptr)
 {
-    auto mmap_opt = n00b_mmap_by_address(ptr);
+    n00b_mmap_view_t view;
 
-    if (!n00b_option_is_set(mmap_opt)) {
-        return false;
-    }
-
-    return n00b_option_get(mmap_opt)->kind == n00b_mmap_stack;
+    return n00b_mmap_view_by_address(ptr, &view) && view.kind == n00b_mmap_stack;
 }
 
 #if defined(N00B_USE_INTERNAL_API)

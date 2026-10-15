@@ -2063,6 +2063,25 @@ n00b_pool_init_at(n00b_pool_t *pool) _kargs
         inline_headers    = false;
     }
 
+    // A GC-visible pool has to be able to describe its own allocations. With
+    // neither an inline header nor an OOB record the collector still puts the
+    // pool's pages in its scan tree, so it recognises pointers INTO the pool,
+    // but it can never resolve an object there and so never follows a pointer
+    // OUT of it: every GC-heap reference held only by pool memory is invisible
+    // to the mark. Under the copying collector the referent moves and the
+    // pool's copy is never rewritten; under pin-all it can be reclaimed.
+    // crashappsec/wax's query path is built on exactly this: each query's view
+    // and cursor come from a default-configured n00b_pool_t, and both hold the
+    // store and its shards (found chasing n00b#547; test_gc_pool_trace).
+    //
+    // No pool n00b itself creates is configured this way -- each is hidden or
+    // self-describing -- so only callers relying on these defaults ever reached
+    // it. Give them inline headers, the choice user_pool makes for the same
+    // reason: it is visible precisely so the collector can trace through it.
+    if (!hidden && !__system && !inline_headers && !external_metadata) {
+        inline_headers = true;
+    }
+
     n00b_allocator_setup((n00b_allocator_t *)pool,
                          (n00b_calloc_fn)pool_alloc,
                          .free              = (n00b_free_fn)pool_free,

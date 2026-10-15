@@ -342,7 +342,8 @@ install_gc_payload(result_payload_holder_t *holder, n00b_arena_t *arena)
 static void
 assert_payload_holder_scan_layout(result_payload_holder_t *holder)
 {
-    n00b_alloc_info_t info = n00b_find_alloc_info(holder);
+    bool              pin  = false;
+    n00b_alloc_info_t info = n00b_find_alloc_info(holder, .pin = &pin);
     assert(info.kind == n00b_alloc_oob || info.kind == n00b_alloc_inline);
 
     n00b_gc_scan_kind_t scan_kind;
@@ -359,6 +360,7 @@ assert_payload_holder_scan_layout(result_payload_holder_t *holder)
         scan_cb   = info.hdr.in_line->scan_cb;
         scan_user = info.hdr.in_line->scan_user;
     }
+    n00b_alloc_hdr_unpin(pin);
 
     const uint64_t holder_words = RESULT_WORDS(result_payload_holder_t);
     const size_t   payload_offset =

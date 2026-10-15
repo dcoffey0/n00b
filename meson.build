@@ -2331,6 +2331,45 @@ test('rocs_retention_pinned_bench',
     env: {'ROCS_BENCH_SIZES': '8,16', 'ROCS_BENCH_RECORDS': '2'},
 )
 
+# n00b#547: a GC-heap object held only by an object in a default-configured
+# pool survives collection -- the deterministic form of the query race below.
+gc_pool_trace_test = executable('test_gc_pool_trace',
+    ['test/unit/test_gc_pool_trace.c'],
+    kwargs: test_common_kwargs,
+)
+test('gc_pool_trace_copying', gc_pool_trace_test, suite: 'unit',
+    env: {'N00B_GC_PIN_ALL': '0'})
+test('gc_pool_trace_pin_all', gc_pool_trace_test, suite: 'unit',
+    env: {'N00B_GC_PIN_ALL': '1'})
+
+# n00b#547: a newest-first reader paging a hot shard while a writer commits
+# batches into it, shaped like crashappsec/wax's rocs_query_race. Collection
+# pressure is on: without it the test collects once or twice and reaches
+# neither defect it was written against.
+rocs_query_race_test = executable('test_rocs_query_race',
+    ['test/unit/test_rocs_query_race.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_query_race', rocs_query_race_test, suite: 'unit',
+    env: {'N00B_QUERY_RACE_SECONDS': '4',
+          'N00B_QUERY_RACE_GC_PRESSURE': '16'})
+
+bench_gc_pause_budget = executable('bench_gc_pause_budget',
+    ['test/unit/bench_gc_pause_budget.c'],
+    kwargs: test_common_kwargs,
+)
+
+# n00b#539. runtime.h documents a 0.25s pause budget that nothing enforced;
+# this is the assertion. Registered small so it gates pause REGRESSIONS on
+# every run -- the survivor sweep that shows the growth shape wants the binary
+# run directly with N00B_BENCH_SURVIVORS.
+test('gc_pause_budget',
+    bench_gc_pause_budget,
+    suite: 'unit',
+    env: {'N00B_BENCH_SURVIVORS': '2000,4000',
+          'N00B_BENCH_PAUSE_BUDGET_MS': '250'},
+)
+
 bench_rocs_catalog_rewrite = executable('bench_rocs_catalog_rewrite',
     ['test/unit/bench_rocs_catalog_rewrite.c'],
     kwargs: test_common_kwargs,
@@ -2852,6 +2891,17 @@ arena_segment_stw_race_test = executable('test_arena_segment_stw_race',
 )
 test('arena_segment_stw_race', arena_segment_stw_race_test, suite: 'unit',
      timeout: 180)
+
+# An allocation header used across a collection. POSIX-only: the guard case
+# re-runs the binary with fork and exec.
+if target_os != 'windows'
+alloc_hdr_stw_race_test = executable('test_alloc_hdr_stw_race',
+    ['test/unit/test_alloc_hdr_stw_race.c'],
+    kwargs: test_common_kwargs,
+)
+test('alloc_hdr_stw_race', alloc_hdr_stw_race_test, suite: 'unit',
+     timeout: 120)
+endif
 
 # n00b-lang/n00b#432: the marshal's private scratch pool must stay within a
 # small multiple of the image it produces.  It used to retain one block per
@@ -3680,6 +3730,12 @@ gc_test = executable('test_gc',
 test('gc', gc_test, suite: 'unit')
 test('gc_pin_all', gc_test, suite: 'unit', env: ['N00B_GC_PIN_ALL=1'])
 
+mmap_registry_reads_test = executable('test_mmap_registry_reads',
+    ['test/unit/test_mmap_registry_reads.c'],
+    kwargs: test_common_kwargs,
+)
+test('mmap_registry_reads', mmap_registry_reads_test, suite: 'unit')
+
 # Verifies availability reporting in default builds and attribution when
 # debug_live_census is enabled.
 pool_audit_test = executable('test_pool_audit',
@@ -4090,6 +4146,18 @@ dense_postings_test = executable('test_rocs_dense_postings',
     kwargs: test_common_kwargs,
 )
 test('rocs_dense_postings', dense_postings_test, suite: 'unit')
+
+posting_writes_test = executable('test_rocs_posting_writes',
+    ['test/unit/test_rocs_posting_writes.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_posting_writes', posting_writes_test, suite: 'unit')
+
+ingest_locks_test = executable('test_rocs_ingest_locks',
+    ['test/unit/test_rocs_ingest_locks.c'],
+    kwargs: test_common_kwargs,
+)
+test('rocs_ingest_locks', ingest_locks_test, suite: 'unit')
 
 condition_test = executable('test_condition',
     ['test/unit/test_condition.c'],

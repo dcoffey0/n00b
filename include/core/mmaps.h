@@ -98,6 +98,45 @@ typedef struct {
  */
 extern n00b_option_t(n00b_mmap_info_t *) n00b_mmap_lookup(n00b_mmap_ctx_t *ctx, void *addr);
 
+/**
+ * @brief The registry fields an address lookup needs, copied out under the
+ *        registry lock. A collection frees the from-space records, so only a
+ *        caller that controls a mapping's lifetime reads its record directly.
+ */
+typedef struct {
+    uint64_t             start;
+    uint64_t             end;
+    n00b_allocator_t    *allocator;
+    uint64_t             max_alloc_len;
+    n00b_mmap_rec_kind_t kind;
+    n00b_mmap_perms_t    perms;
+} n00b_mmap_view_t;
+
+/**
+ * @brief Copy the registry record covering @p addr into @p out.
+ * @return false when no mapping covers @p addr.
+ */
+extern bool n00b_mmap_view_by_address(void *addr, n00b_mmap_view_t *out);
+
+/**
+ * @brief Copy @p info into @p out. Only for a caller that controls the
+ *        mapping's lifetime, such as the collector under stop-the-world.
+ */
+extern void n00b_mmap_view_of(n00b_mmap_info_t *info, n00b_mmap_view_t *out);
+
+#ifdef N00B_DEBUG
+/**
+ * @brief Debug-only hook run after a registry lookup has released the
+ *        registry lock and before its caller reads the result.
+ */
+extern void (*n00b_mmap_debug_lookup_hook)(void *addr);
+/**
+ * @brief Debug-only: fill each freed mapping record with 0xdb and never
+ *        reuse it, so a read of a freed record sees the pattern.
+ */
+extern bool n00b_mmap_debug_poison_freed_records;
+#endif
+
 extern n00b_mmap_registry_stats_t n00b_mmap_registry_stats(void);
 
 /**
