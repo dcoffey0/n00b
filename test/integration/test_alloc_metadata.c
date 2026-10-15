@@ -59,7 +59,8 @@ test_oob_lookup(void)
     uint64_t *p = n00b_alloc(uint64_t);
     assert(p != nullptr);
 
-    n00b_alloc_info_t info = n00b_find_alloc_info(p);
+    bool              pin  = false;
+    n00b_alloc_info_t info = n00b_find_alloc_info(p, .pin = &pin);
 
     // Should find some kind of record (oob, inline, or err — not none)
     assert(n00b_alloc_info_exists(info));
@@ -71,6 +72,7 @@ test_oob_lookup(void)
         n00b_oob_hdr_t *oob = n00b_option_get(oob_opt);
         assert(oob != nullptr);
     }
+    n00b_alloc_hdr_unpin(pin);
 
     printf("  [PASS] oob_lookup\n");
 }
@@ -91,12 +93,14 @@ test_oob_user_ptr(void)
     uint64_t *p = n00b_alloc_with_opts(uint64_t, &(n00b_alloc_opts_t){.allocator = alloc});
     assert(p != nullptr);
 
-    n00b_alloc_info_t info = n00b_find_alloc_info(p);
+    bool              pin  = false;
+    n00b_alloc_info_t info = n00b_find_alloc_info(p, .pin = &pin);
 
     if (info.kind == n00b_alloc_oob) {
         n00b_oob_hdr_t *oob = info.hdr.oob;
         assert(oob->user_ptr == p);
     }
+    n00b_alloc_hdr_unpin(pin);
 
     printf("  [PASS] oob_user_ptr\n");
 }
@@ -111,7 +115,9 @@ test_find_alloc_info_kind(void)
     uint64_t *p = n00b_alloc(uint64_t);
     assert(p != nullptr);
 
-    n00b_alloc_info_t info = n00b_find_alloc_info(p);
+    bool              pin  = false;
+    n00b_alloc_info_t info = n00b_find_alloc_info(p, .pin = &pin);
+    n00b_alloc_hdr_unpin(pin);
 
     // Should return a recognized kind (inline, oob, or err — not none).
     // The exact kind depends on allocator configuration during the merge.

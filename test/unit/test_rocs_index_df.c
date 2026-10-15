@@ -586,17 +586,11 @@ test_key_equality_tracks_postings_not_syntax(void)
     n00b_printf("  [PASS] key equality tracks postings, not syntax");
 }
 
-// Where a posting list's lock lives, asserted directly rather than by waiting
-// for a large shard to fault.
-//
-// It has to come from the same allocator as the list. A store's hot pool never
-// moves and is freed with the shard, so the lock neither relocates under a
-// futex waiter nor outlives what it guards. The two ways to get this wrong
-// both hide: the default moving heap only faults once a collect relocates it,
-// which needs tens of thousands of records, and the runtime system pool never
-// faults at all and simply leaks one rwlock per term per field per shard.
+// A posting list has one writer and lock-free readers, so it carries no lock,
+// and its storage comes from the shard's allocator: growth leaves the old array
+// to that pool, which is non-moving and freed with the shard.
 static void
-test_posting_lock_belongs_to_the_shard_allocator(void)
+test_posting_lists_are_unlocked_in_the_shard_allocator(void)
 {
     sample_t s = sample();
 
@@ -612,23 +606,19 @@ test_posting_lock_belongs_to_the_shard_allocator(void)
             continue;
         }
         CHECK(postings->ordinals != nullptr);
-        CHECK(postings->ordinals->lock != nullptr);
-
-        // Same allocator the list itself records, which is the shard's.
+        CHECK(postings->ordinals->lock == nullptr);
         CHECK(postings->ordinals->allocator == test_shard_allocator());
 
-        // And the lock is inside it: a system-pool lock resolves differently
-        // from an allocation made in the shard's pool.
-        n00b_alloc_info_t lock_ai
-            = n00b_find_alloc_info(postings->ordinals->lock, .scan_for_header = true);
+        n00b_alloc_info_t data_ai
+            = n00b_find_alloc_info(postings->ordinals->data, .scan_for_header = true);
         n00b_alloc_info_t list_ai
             = n00b_find_alloc_info(postings->ordinals, .scan_for_header = true);
-        CHECK(lock_ai.kind == list_ai.kind);
+        CHECK(data_ai.kind == list_ai.kind);
         checked++;
     });
 
     CHECK(checked > 0);
-    n00b_printf("  [PASS] posting lock belongs to the shard allocator");
+    n00b_printf("  [PASS] posting lists are unlocked, in the shard allocator");
 }
 
 int
@@ -647,7 +637,7 @@ main(int argc, char **argv)
     test_sealed_image_answers_without_the_order_bit();
     test_descending_adds_answer_the_same();
     test_key_equality_tracks_postings_not_syntax();
-    test_posting_lock_belongs_to_the_shard_allocator();
+    test_posting_lists_are_unlocked_in_the_shard_allocator();
 
     n00b_shutdown();
     return 0;

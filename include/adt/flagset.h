@@ -40,7 +40,32 @@ n00b_flagset_init(n00b_flagset_t *self) _kargs
     bool              locked    = true;
 };
 
+extern void            n00b_flagset_trim(n00b_flagset_t *self);
 extern n00b_flagset_t *n00b_flagset_copy(const n00b_flagset_t *self);
+
+/**
+ * @brief Set a bit in a set that has one writer and lock-free readers.
+ *
+ * For a set built with `.locked = false`. Only one thread may call this on a
+ * given set at a time, and no other mutator may run alongside it. Growth
+ * leaves the previous array allocated, since a reader may still hold it.
+ *
+ * @return true when the bit was clear before.
+ */
+extern bool n00b_flagset_set_owned(n00b_flagset_t *self, uint64_t index);
+
+/**
+ * @brief Borrow the words of a set written by n00b_flagset_set_owned.
+ *
+ * Safe against the one writer without a lock. A bit is visible once the
+ * reader has synchronized with a release the writer made after setting it:
+ * the length store when that bit extended the set, or whatever the caller
+ * publishes otherwise. Read each word with a relaxed atomic load, since the
+ * writer may be setting other bits in it.
+ */
+extern void n00b_flagset_view(const n00b_flagset_t *self,
+                              const uint64_t      **words,
+                              uint64_t             *wordlen);
 extern n00b_flagset_t *n00b_flagset_invert(const n00b_flagset_t *self);
 extern n00b_flagset_t *n00b_flagset_add(const n00b_flagset_t *self,
                                         const n00b_flagset_t *with);

@@ -32,7 +32,7 @@ SKIP_DIRS = ("src/vendor",)
 # Call sites per file, with why each one's cost is bounded.
 ALLOWED = {
     "src/core/alloc.c": (1, "defines n00b_find_alloc_info_in"),
-    "src/core/alloc_interpose.c": (3, "one resolution per libc call"),
+    "src/core/alloc_interpose.c": (2, "one resolution per libc call"),
     "src/core/gc.c": (2, "the mark's walk shares the guard memo; the register "
                          "pin pre-pass runs once per captured register"),
     "src/rocs/index.c": (1, "sets the scan kind of one allocation"),

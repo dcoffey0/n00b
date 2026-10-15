@@ -266,7 +266,8 @@ typedef struct {
     n00b_gc_scan_cb_t   scan_cb;
     void               *scan_user;
     // Optional per-allocation audit-site override ("file:line"). When non-null,
-    // the per-site pool audit attributes this allocation to it instead of the
+    // the per-site pool audit and the OOB record's file_name attribute this
+    // allocation to it instead of the
     // innermost N00B_LOC_STRING() capture, so a caller (or a _*_at wrapper that
     // threads its alloc_location down) can trace the allocation back to the real
     // instantiation site rather than the primitive in string.c/buffer.c. Null
@@ -387,12 +388,22 @@ extern void n00b_allocator_compact_metadata(n00b_allocator_t *allocator);
  *
  * @kw allocator       Allocator to search (nullptr = search all).
  * @kw scan_for_header If true, scan backward for an inline header.
+ * @kw pin             Set to true when the lookup returns an OOB header that
+ *                     a collection or metadata compaction could reclaim. The
+ *                     lookup then keeps stop-the-world held off until the
+ *                     caller passes the flag to @ref n00b_alloc_hdr_unpin.
+ *
+ * Such a header is valid only while stop-the-world is held off, so a caller
+ * that reads or writes through it must pass @c .pin, or already hold the STW
+ * gate. A collection waits for the pin, so keep the span short. In
+ * N00B_DEBUG builds a lookup that returns such a header unpinned aborts.
  */
 [[n00b::nogc]] extern void
 _n00b_find_alloc_info(void *addr, n00b_alloc_info_t *result) _kargs
 {
     n00b_allocator_t *allocator       = nullptr;
     bool              scan_for_header = false;
+    bool             *pin             = nullptr;
 };
 
 // Get this in the caller's frame.
@@ -403,11 +414,27 @@ _n00b_find_alloc_info(void *addr, n00b_alloc_info_t *result) _kargs
         _info;                                                                                 \
     })
 
+/** @brief Release the pin a lookup took for its @c .pin flag. */
+extern void n00b_alloc_hdr_unpin(bool pinned);
+
+#if defined(N00B_DEBUG)
+/**
+ * @brief Test-only hook, called when a lookup returns an OOB header that needs
+ *        a pin, after the lookup releases its own hold on the STW gate.
+ *
+ * Null outside tests. A test parks the caller here to race a collection
+ * against the caller's use of the header.
+ */
+extern void (*n00b_alloc_hdr_lookup_hook)(void *addr);
+#endif
+
 // Fast-path resolver: resolve `addr` via a KNOWN external-metadata allocator's
 // OOB index, skipping the global mmap interval-tree search.  Returns
 // kind=n00b_alloc_oob on hit, kind=n00b_alloc_none on miss (fall back to
-// n00b_find_alloc_info).  See the definition for constraints.
-extern n00b_alloc_info_t n00b_try_alloc_info_in_allocator(void *addr, n00b_allocator_t *al);
+// n00b_find_alloc_info).  A hit sets *pin as n00b_find_alloc_info's .pin does.
+// See the definition for constraints.
+extern n00b_alloc_info_t
+n00b_try_alloc_info_in_allocator(void *addr, n00b_allocator_t *al, bool *pin);
 
 /**
  * @brief Configure an allocator's vtable and options.

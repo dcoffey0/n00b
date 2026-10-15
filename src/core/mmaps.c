@@ -177,6 +177,9 @@ mmap_unlock(n00b_mmap_ctx_t *ctx)
 #define mmap_write_unlock(ctx) mmap_unlock(ctx)
 #define mmap_read_unlock(ctx)  mmap_unlock(ctx)
 
+[[n00b::nogc]] static n00b_option_t(n00b_mmap_info_t *)
+n00b_mmap_lookup_unlocked(n00b_mmap_ctx_t *ctx, void *addr);
+
 /* Async-signal-handler-callable lookup: pulls fields out of the
  * existing mmap registry for a candidate faulting address.  No
  * @ref n00b_eprintf, no n00b_string_t allocation — only the tree's
@@ -195,17 +198,21 @@ n00b_mmap_handler_lookup(uintptr_t addr,
                          const char **out_source_file,
                          uint32_t *out_source_line)
 {
-    auto opt = n00b_mmap_by_address((void *)addr);
-    if (!n00b_option_is_set(opt)) {
-        return NULL;
+    n00b_mmap_ctx_t  *ctx  = n00b_global_mem_map(n00b_get_runtime());
+    n00b_mmap_info_t *info = nullptr;
+
+    mmap_read_lock(ctx);
+    auto opt = n00b_mmap_lookup_unlocked(ctx, (void *)addr);
+    if (n00b_option_is_set(opt)) {
+        info = n00b_option_get(opt);
+        if (out_start) *out_start = info->start;
+        if (out_end)   *out_end   = info->end;
+        if (out_kind)  *out_kind  = (uint32_t)info->kind;
+        if (out_file)  *out_file  = info->file;
+        if (out_source_file) *out_source_file = info->source_file;
+        if (out_source_line) *out_source_line = info->source_line;
     }
-    n00b_mmap_info_t *info = n00b_option_get(opt);
-    if (out_start) *out_start = info->start;
-    if (out_end)   *out_end   = info->end;
-    if (out_kind)  *out_kind  = (uint32_t)info->kind;
-    if (out_file)  *out_file  = info->file;
-    if (out_source_file) *out_source_file = info->source_file;
-    if (out_source_line) *out_source_line = info->source_line;
+    mmap_read_unlock(ctx);
     return info;
 }
 
@@ -743,6 +750,22 @@ n00b_mmap_free_registry_obj(n00b_mmap_ctx_t *ctx, void *ptr)
     }
 }
 
+#ifdef N00B_DEBUG
+bool n00b_mmap_debug_poison_freed_records = false;
+#endif
+
+static inline void
+n00b_mmap_free_info_record(n00b_mmap_ctx_t *ctx, n00b_mmap_info_t *info)
+{
+#ifdef N00B_DEBUG
+    if (n00b_mmap_debug_poison_freed_records && info != nullptr) {
+        memset(info, 0xdb, sizeof(*info));
+        return;
+    }
+#endif
+    n00b_mmap_free_registry_obj(ctx, info);
+}
+
 static inline void
 n00b_mmaps_remove(n00b_mmap_ctx_t *ctx, n00b_mmap_info_t *info)
 {
@@ -753,7 +776,7 @@ n00b_mmaps_remove(n00b_mmap_ctx_t *ctx, n00b_mmap_info_t *info)
     mmap_write_unlock(ctx);
 
     if (detached) {
-        n00b_mmap_free_registry_obj(ctx, info);
+        n00b_mmap_free_info_record(ctx, info);
     }
 }
 
@@ -925,6 +948,22 @@ n00b_mmap_range_by_address(void *addr) _kargs
     return n00b_option_none(n00b_alloc_range_t *);
 }
 
+#ifdef N00B_DEBUG
+void (*n00b_mmap_debug_lookup_hook)(void *addr) = nullptr;
+#endif
+
+[[n00b::nogc]] static inline void
+mmap_lookup_done(void *addr)
+{
+#ifdef N00B_DEBUG
+    if (n00b_mmap_debug_lookup_hook != nullptr) {
+        n00b_mmap_debug_lookup_hook(addr);
+    }
+#else
+    (void)addr;
+#endif
+}
+
 [[n00b::nogc]]
 n00b_option_t(n00b_mmap_info_t *)
 n00b_mmap_lookup(n00b_mmap_ctx_t *ctx, void *addr)
@@ -934,8 +973,44 @@ n00b_mmap_lookup(n00b_mmap_ctx_t *ctx, void *addr)
     mmap_read_lock(ctx);
     result = n00b_mmap_lookup_unlocked(ctx, addr);
     mmap_read_unlock(ctx);
+    mmap_lookup_done(addr);
 
     return result;
+}
+
+[[n00b::nogc]] static inline void
+mmap_view_copy(n00b_mmap_info_t *info, n00b_mmap_view_t *out)
+{
+    out->start         = info->start;
+    out->end           = info->end;
+    out->allocator     = atomic_load_explicit(&info->allocator, memory_order_relaxed);
+    out->max_alloc_len = atomic_load_explicit(&info->max_alloc_len, memory_order_relaxed);
+    out->kind          = info->kind;
+    out->perms         = info->perms;
+}
+
+[[n00b::nogc]] void
+n00b_mmap_view_of(n00b_mmap_info_t *info, n00b_mmap_view_t *out)
+{
+    mmap_view_copy(info, out);
+}
+
+[[n00b::nogc]] bool
+n00b_mmap_view_by_address(void *addr, n00b_mmap_view_t *out)
+{
+    n00b_mmap_ctx_t *ctx   = n00b_global_mem_map(n00b_get_runtime());
+    bool             found = false;
+
+    mmap_read_lock(ctx);
+    auto opt = n00b_mmap_lookup_unlocked(ctx, addr);
+    if (n00b_option_is_set(opt)) {
+        mmap_view_copy(n00b_option_get(opt), out);
+        found = true;
+    }
+    mmap_read_unlock(ctx);
+    mmap_lookup_done(addr);
+
+    return found;
 }
 
 // ============================================================================
@@ -1459,7 +1534,7 @@ n00b_munmap(void *addr) _kargs
 
     n00b_mmap_free_detached_ranges(ctx, &dead);
     if (detached) {
-        n00b_mmap_free_registry_obj(ctx, map);
+        n00b_mmap_free_info_record(ctx, map);
     }
 
 #ifdef _WIN32
@@ -1500,7 +1575,7 @@ n00b_mmap_unregister(void *start) _kargs
 
     n00b_mmap_free_detached_ranges(ctx, &dead);
     if (detached) {
-        n00b_mmap_free_registry_obj(ctx, map);
+        n00b_mmap_free_info_record(ctx, map);
     }
 }
 
@@ -1523,18 +1598,21 @@ n00b_mem_get_allocator(void *addr) _kargs
     n00b_runtime_t *runtime = n00b_get_runtime();
 }
 {
-    auto mmap_opt = n00b_mmap_lookup(n00b_global_mem_map(runtime), addr);
+    n00b_mmap_ctx_t  *ctx       = n00b_global_mem_map(runtime);
+    n00b_allocator_t *allocator = nullptr;
 
-    if (!n00b_option_is_set(mmap_opt)) {
+    mmap_read_lock(ctx);
+    auto mmap_opt = n00b_mmap_lookup_unlocked(ctx, addr);
+    if (n00b_option_is_set(mmap_opt)) {
+        allocator = n00b_atomic_load(&n00b_option_get(mmap_opt)->allocator);
+    }
+    mmap_read_unlock(ctx);
+    mmap_lookup_done(addr);
+
+    if (allocator == nullptr) {
         return n00b_option_none(n00b_allocator_t *);
     }
-
-    n00b_mmap_info_t *mmap = n00b_option_get(mmap_opt);
-
-    if (!mmap->allocator) {
-        return n00b_option_none(n00b_allocator_t *);
-    }
-    return n00b_option_set(n00b_allocator_t *, n00b_atomic_load(&mmap->allocator));
+    return n00b_option_set(n00b_allocator_t *, allocator);
 }
 
 // ============================================================================

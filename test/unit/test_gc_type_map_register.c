@@ -97,12 +97,16 @@ test_registered_layout_upgrades_alloc(void)
                                               ARENA_OPTS(arena));
     CHECK(p != nullptr);
 
-    n00b_alloc_info_t info = n00b_find_alloc_info(p, .scan_for_header = true);
+    bool              pin  = false;
+    n00b_alloc_info_t info = n00b_find_alloc_info(p,
+                                                  .scan_for_header = true,
+                                                  .pin             = &pin);
     CHECK(info.kind == n00b_alloc_oob);
     CHECK(info.hdr.oob->tinfo == PROBE_HASH_A);
     CHECK(info.hdr.oob->scan_kind == N00B_GC_SCAN_KIND_CALLBACK);
     CHECK(info.hdr.oob->scan_cb == n00b_gc_scan_cb_type_layout);
     CHECK(info.hdr.oob->scan_user == (void *)&probe_layout_a);
+    n00b_alloc_hdr_unpin(pin);
 }
 
 int

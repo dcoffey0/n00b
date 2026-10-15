@@ -69,25 +69,17 @@ typedef enum : int32_t {
 /** @brief Marshalable posting object for a normalized field value. */
 typedef struct n00b_store_posting_list {
     n00b_store_postings_kind_t         kind;
-    // Atomic because the fast path in rocs_posting_list_ensure_ordered reads
-    // it without the ordinal list's lock, to decide whether taking that lock
-    // is worth it, while pushes write it under the lock. That is a data race
-    // by the memory model even where no execution can observe a stale value.
+    // Atomic because the list's one writer clears it while hot readers test
+    // it with no lock between them.
     //
     // The image holds this struct byte for byte, so atomicity must not move
     // or resize the field; map.c's static asserts enforce that.
     _Atomic uint32_t                   reserved;
-    // Member ordinals for a sparse list, maintained on insert under the
-    // ordinal list's write lock and read under its read lock. A dense list
-    // leaves this zero: its members are the set bits, which a hot reader
-    // popcounts and sealing recomputes from, so a second copy here would only
-    // be something to keep in sync.
+    // Number of members, kept by the list's one writer and read lock-free.
+    // Sealing recomputes it for a dense list from the set bits.
     //
-    // Atomic because there is no one lock a reader could take. Each writer
-    // holds one over the update, a sparse list's ordinal lock or a dense
-    // list's flag set lock, but those are different locks and sealing writes
-    // the field under neither. A reader on the query path holds none of them.
-    // The same layout constraint as `reserved` applies.
+    // Atomic because readers on the query path load it while the writer
+    // stores it. The same layout constraint as `reserved` applies.
     //
     // A reader may still see an element land before the count describing it,
     // so the count is an estimate for that moment. Every consumer sizes work
@@ -105,12 +97,13 @@ typedef struct n00b_store_posting_list {
  * sets @c N00B_STORE_POSTINGS_ORDERED. Idempotent; a no-op on a dense list or
  * one already ordered.
  *
- * @warning For the list's owner only. It takes the write lock and renumbers
- *          the list, so a reader calling it would mutate shared state to
- *          answer a question and shift elements under other readers. Sealing
- *          calls it, which is why every image is written ordered; so may a
- *          caller ordering a list it just built. Readers take a private copy
- *          and sort that, or consult @c N00B_STORE_POSTINGS_ORDERED and scan.
+ * @warning For the shard's sealer only, once no hot reader can reach the
+ *          list. It renumbers the list in place with no lock, so it must not
+ *          run alongside a reader or a push. A store drains the shard's hot
+ *          readers before every seal, and sealing calls it, which is why
+ *          every image is written ordered.
+ *          Readers take a private copy and sort that, or consult
+ *          @c N00B_STORE_POSTINGS_ORDERED and scan.
  */
 extern void
 rocs_posting_list_ensure_ordered(n00b_store_posting_list_t *postings);
@@ -283,6 +276,8 @@ typedef struct n00b_store_shard {
     n00b_store_raw_list_t    *retain_raw;
     n00b_store_raw_blob_t    *raw_bytes;
     n00b_shard_state_t        state;
+    // Zero in every image. Debug builds hold it nonzero while a thread pushes
+    // into this shard's posting lists, to catch a second concurrent writer.
     uint32_t                  reserved;
     uint64_t                  record_count;
     uint64_t                  byte_estimate;
@@ -501,6 +496,23 @@ n00b_store_shard_append(n00b_store_shard_t *shard,
 extern n00b_result_t(uint64_t)
 n00b_store_shard_reserve(n00b_store_shard_t *shard,
                          uint64_t            count);
+
+/**
+ * @brief Length of a shard's record list, read without a lock.
+ *
+ * The list has one writer. This counts reserved slots too, so a slot below
+ * the length may still be null until it is filled.
+ */
+extern uint64_t n00b_store_shard_records_len(n00b_store_shard_t *shard);
+
+/**
+ * @brief The stored text of one record, read without a lock.
+ *
+ * @return The record's compact JSON text, or null when @p ordinal is past the
+ *         list or names a slot that is reserved but not yet filled.
+ */
+extern n00b_string_t *n00b_store_shard_record_at(n00b_store_shard_t *shard,
+                                                 uint64_t            ordinal);
 
 /**
  * @brief Fill one previously reserved hot-shard slot.

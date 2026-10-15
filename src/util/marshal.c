@@ -1991,19 +1991,23 @@ scan_node(n00b_marshal_ctx_t *ctx, n00b_marshal_node_t *node)
             // Most pointers in a graph cluster in one pool, so this turns the
             // per-pointer tree search into an O(1) OOB-index hit.
             if (!rewritten) {
+                bool              pin       = false;
                 n00b_alloc_info_t home_info = n00b_try_alloc_info_in_allocator(
                     (void *)(uintptr_t)word,
-                    ctx->home_allocator);
+                    ctx->home_allocator,
+                    &pin);
                 if (home_info.kind == n00b_alloc_oob) {
-                    if (!marshal_resolve_and_rewrite(ctx, words, i, word, home_info)) {
+                    bool ok = marshal_resolve_and_rewrite(ctx, words, i, word, home_info);
+                    n00b_alloc_hdr_unpin(pin);
+                    if (!ok) {
                         return;
                     }
                     rewritten = true;
                 }
                 else {
-                    auto mmap_opt = n00b_mmap_by_address((void *)(uintptr_t)word);
-                    if (n00b_option_is_set(mmap_opt)) {
-                        n00b_mmap_info_t *map = n00b_option_get(mmap_opt);
+                    n00b_mmap_view_t mview;
+                    if (n00b_mmap_view_by_address((void *)(uintptr_t)word, &mview)) {
+                        n00b_mmap_view_t *map = &mview;
                         switch (map->kind) {
                         case n00b_mmap_managed_segment:
                         case n00b_mmap_pool:
@@ -2012,8 +2016,12 @@ scan_node(n00b_marshal_ctx_t *ctx, n00b_marshal_node_t *node)
                             // clustered pointers take the fast path above.
                             ctx->home_allocator = map->allocator;
                             n00b_alloc_info_t info = n00b_find_alloc_info(
-                                (void *)(uintptr_t)word, .scan_for_header = true);
-                            if (!marshal_resolve_and_rewrite(ctx, words, i, word, info)) {
+                                (void *)(uintptr_t)word,
+                                .scan_for_header = true,
+                                .pin             = &pin);
+                            bool ok = marshal_resolve_and_rewrite(ctx, words, i, word, info);
+                            n00b_alloc_hdr_unpin(pin);
+                            if (!ok) {
                                 return;
                             }
                             rewritten = true;
@@ -2122,8 +2130,12 @@ marshal_process(n00b_marshal_ctx_t *ctx, void *addr)
         return false;
     }
 
-    n00b_alloc_info_t info = n00b_find_alloc_info(addr, .scan_for_header = true);
+    bool                 pin  = false;
+    n00b_alloc_info_t    info = n00b_find_alloc_info(addr,
+                                                     .scan_for_header = true,
+                                                     .pin             = &pin);
     n00b_marshal_node_t *root = marshal_add_alloc(ctx, info);
+    n00b_alloc_hdr_unpin(pin);
     if (!root) {
         return false;
     }
@@ -3167,15 +3179,16 @@ unmarshal_slot_patch_op(n00b_marshal_patch_slots_t *slots, uint64_t vaddr)
 }
 
 static void
-patch_alloc_metadata(void              *user_ptr,
-                     n00b_marshal_alloc_record_t *rec,
-                     n00b_gc_scan_cb_t  scan_cb,
-                     void              *scan_user)
+patch_alloc_headers(void                        *user_ptr,
+                    n00b_marshal_alloc_record_t *rec,
+                    n00b_gc_scan_cb_t            scan_cb,
+                    void                        *scan_user,
+                    bool                        *pin)
 {
     // For CALLBACK records, scan_cb / scan_user are restored from the
     // CBSCAN ext (resolved tag + identity); for all other records they
     // are null.
-    n00b_alloc_info_t info = n00b_find_alloc_info(user_ptr);
+    n00b_alloc_info_t info = n00b_find_alloc_info(user_ptr, .pin = pin);
     if (info.kind == n00b_alloc_oob) {
         n00b_oob_hdr_t *oob = info.hdr.oob;
         bool            ptr_words_known =
@@ -3215,6 +3228,17 @@ patch_alloc_metadata(void              *user_ptr,
         hdr->scan_user       = scan_user;
         hdr->cached_hash     = rec->cached_hash;
     }
+}
+
+static void
+patch_alloc_metadata(void                        *user_ptr,
+                     n00b_marshal_alloc_record_t *rec,
+                     n00b_gc_scan_cb_t            scan_cb,
+                     void                        *scan_user)
+{
+    bool pin = false;
+    patch_alloc_headers(user_ptr, rec, scan_cb, scan_user, &pin);
+    n00b_alloc_hdr_unpin(pin);
 }
 
 static bool
@@ -3388,9 +3412,9 @@ unmarshal_relink_records(n00b_unmarshal_ctx_t *ctx)
                 return false;
             }
 
-            auto mmap_opt = n00b_mmap_by_address((void *)(uintptr_t)patch->static_addr);
-            if (!n00b_option_is_set(mmap_opt)
-                || n00b_option_get(mmap_opt)->kind != n00b_mmap_static) {
+            n00b_mmap_view_t view;
+            if (!n00b_mmap_view_by_address((void *)(uintptr_t)patch->static_addr, &view)
+                || view.kind != n00b_mmap_static) {
                 marshal_set_error(&ctx->status,
                                   &ctx->error,
                                   N00B_MARSHAL_ERR_BAD_STREAM,

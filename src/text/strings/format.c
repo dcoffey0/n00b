@@ -132,21 +132,19 @@ format_arg_is_plausible_string(n00b_string_t *s)
     // the C string as an n00b_string_t header; its "data" word is usually
     // garbage or another unmanaged value. Real n00b_string_t instances point at
     // payload bytes, not at the start of another managed allocation header.
-    n00b_alloc_info_t dinfo = n00b_find_alloc_info(s->data);
+    bool              pin       = false;
+    n00b_alloc_info_t dinfo     = n00b_find_alloc_info(s->data, .pin = &pin);
+    bool              plausible = !n00b_value_is_data(s->data);
     if (n00b_alloc_info_is_heap(dinfo)) {
         char    *alloc_start = nullptr;
         uint64_t alloc_len   = 0;
-        if (!format_bounds_for_heap_alloc(dinfo, &alloc_start, &alloc_len)) {
-            return false;
-        }
-        if (alloc_start == (char *)s->data) {
-            return false;
-        }
-        return (char *)s->data > alloc_start
-            && ((char *)s->data + s->u8_bytes) <= (alloc_start + alloc_len);
+        plausible = format_bounds_for_heap_alloc(dinfo, &alloc_start, &alloc_len)
+                 && (char *)s->data > alloc_start
+                 && ((char *)s->data + s->u8_bytes) <= (alloc_start + alloc_len);
     }
+    n00b_alloc_hdr_unpin(pin);
 
-    return !n00b_value_is_data(s->data);
+    return plausible;
 }
 
 static void
