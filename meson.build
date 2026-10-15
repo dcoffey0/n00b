@@ -2370,6 +2370,20 @@ test('gc_pause_budget',
           'N00B_BENCH_PAUSE_BUDGET_MS': '250'},
 )
 
+# n00b#533: a file-scope n00b_pinref_t must root what it points at. ncc used to
+# emit `&(g_pinref).raw` on the _Atomic struct for --ncc-auto-gc-roots, which is
+# not a legal address, so this did not compile -- or, where the root table was
+# not emitted, the global got no root at all and its target was collected.
+# Needs ncc 7ab04e70 (crashappsec/ncc#65) or newer.
+gc_pinref_root_test = executable('test_gc_pinref_root',
+    ['test/unit/test_gc_pinref_root.c'],
+    kwargs: test_common_kwargs,
+)
+test('gc_pinref_root_copying', gc_pinref_root_test, suite: 'unit',
+    env: {'N00B_GC_PIN_ALL': '0'})
+test('gc_pinref_root_pin_all', gc_pinref_root_test, suite: 'unit',
+    env: {'N00B_GC_PIN_ALL': '1'})
+
 bench_rocs_catalog_rewrite = executable('bench_rocs_catalog_rewrite',
     ['test/unit/bench_rocs_catalog_rewrite.c'],
     kwargs: test_common_kwargs,
