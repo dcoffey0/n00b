@@ -224,9 +224,11 @@ walk_catalog(n00b_buffer_t *image)
 {
     catalog_cost_t c = {};
     c.catalog_bytes  = (uint64_t)n00b_buffer_len(image);
-    CHECK(get_u64(image, 8) == 6);
-    c.entries  = get_u64(image, 64);
-    int64_t at = 72;
+    // v7 header: version at byte 8, log epoch and id at 64 and 72, entry
+    // count at 80, entries from 88 (same layout test_rocs_term_summary walks).
+    CHECK(get_u64(image, 8) == 7);
+    c.entries  = get_u64(image, 80);
+    int64_t at = 88;
     for (uint64_t e = 0; e < c.entries; e++) {
         at += 7 * 8;
         for (int i = 0; i < 3; i++) {
