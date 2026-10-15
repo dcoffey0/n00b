@@ -164,18 +164,25 @@ n00b_static_layout_policy_name(n00b_static_layout_policy_t policy)
 uint64_t
 n00b_obj_typehash(void *obj)
 {
-    n00b_alloc_info_t ainfo = n00b_find_alloc_info(obj);
+    bool              pin   = false;
+    n00b_alloc_info_t ainfo = n00b_find_alloc_info(obj, .pin = &pin);
+    uint64_t          tinfo = 0;
 
     switch (ainfo.kind) {
     case n00b_alloc_oob:
-        return ainfo.hdr.oob->tinfo;
+        tinfo = ainfo.hdr.oob->tinfo;
+        break;
     case n00b_alloc_inline:
-        return ainfo.hdr.in_line->tinfo;
+        tinfo = ainfo.hdr.in_line->tinfo;
+        break;
     case n00b_alloc_static_range:
-        return ainfo.hdr.range->tinfo;
+        tinfo = ainfo.hdr.range->tinfo;
+        break;
     default:
-        return 0;
+        break;
     }
+    n00b_alloc_hdr_unpin(pin);
+    return tinfo;
 }
 
 n00b_option_t(n00b_type_info_t *)

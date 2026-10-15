@@ -28,10 +28,8 @@
 n00b_uint128_t
 n00b_hash(void *obj, n00b_hash_fn fn)
 {
-    n00b_alloc_info_t ainfo = n00b_find_alloc_info(obj);
-    bool managed            = n00b_alloc_info_is_heap(ainfo);
-    bool has_type_metadata  = managed || n00b_alloc_info_is_static_range(ainfo);
-    bool explicit_hash      = fn != nullptr;
+    bool explicit_hash     = fn != nullptr;
+    bool has_type_metadata = false;
 
     auto range_opt = n00b_mmap_range_by_address(obj);
     if (n00b_option_is_set(range_opt)) {
@@ -44,21 +42,24 @@ n00b_hash(void *obj, n00b_hash_fn fn)
         }
     }
 
-    if (managed && !explicit_hash) {
-        // Check cached hash.
-        n00b_uint128_t cached = 0;
+    // The header is valid only while pinned, so the hash function, which can
+    // run arbitrary code, is called outside the pin and the store below looks
+    // the header up again.
+    bool              pin     = false;
+    n00b_alloc_info_t ainfo   = n00b_find_alloc_info(obj, .pin = &pin);
+    bool              managed = n00b_alloc_info_is_heap(ainfo);
+    n00b_uint128_t    cached  = 0;
 
+    has_type_metadata = has_type_metadata || managed
+                     || n00b_alloc_info_is_static_range(ainfo);
+
+    if (managed && !explicit_hash) {
         if (ainfo.kind == n00b_alloc_inline) {
             cached = ainfo.hdr.in_line->cached_hash;
         }
         else {
             cached = ainfo.hdr.oob->cached_hash;
         }
-
-        if (cached) {
-            return cached;
-        }
-
     }
     else if (!explicit_hash && ainfo.kind == n00b_alloc_static_range) {
         // Descriptor-backed static objects carry a build-time-written
@@ -71,11 +72,12 @@ n00b_hash(void *obj, n00b_hash_fn fn)
         // range's cached_hash on a recompute: the value is
         // build-time-authoritative for static objects, and runtime
         // recomputes for static-range hits MUST NOT mutate the slot.
-        n00b_uint128_t cached = ainfo.hdr.range->cached_hash;
+        cached = ainfo.hdr.range->cached_hash;
+    }
 
-        if (cached) {
-            return cached;
-        }
+    n00b_alloc_hdr_unpin(pin);
+    if (cached) {
+        return cached;
     }
 
     // If the caller didn't supply a hash function, try the vtable for any
@@ -97,12 +99,15 @@ n00b_hash(void *obj, n00b_hash_fn fn)
 
     // Cache the result for managed objects.
     if (managed && !explicit_hash) {
+        pin   = false;
+        ainfo = n00b_find_alloc_info(obj, .pin = &pin);
         if (ainfo.kind == n00b_alloc_inline) {
             ainfo.hdr.in_line->cached_hash = hv;
         }
-        else {
+        else if (ainfo.kind == n00b_alloc_oob) {
             ainfo.hdr.oob->cached_hash = hv;
         }
+        n00b_alloc_hdr_unpin(pin);
     }
 
     return hv;

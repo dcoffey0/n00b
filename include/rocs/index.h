@@ -316,6 +316,11 @@ n00b_store_index_advertise(n00b_store_index_t *index,
  * The index descriptor's field is the single source of truth; this call does
  * not accept a second field argument. Hot insertion mutates only the shard's
  * typed column/posting containers.
+ *
+ * @warning Single writer per shard. Posting lists take no lock, so two calls
+ *          on one shard must not overlap, and neither may a call overlap a
+ *          store ingest into that shard. Readers may run alongside. Debug
+ *          builds abort on an overlapping writer.
  */
 extern n00b_result_t(uint64_t)
 n00b_store_index_add(n00b_store_index_t *index,

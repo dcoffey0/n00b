@@ -265,12 +265,20 @@ owned_by_interpose_allocation(void *p)
 static void *
 recover_pool_base(void *p)
 {
-    n00b_alloc_info_t direct = n00b_find_alloc_info(p, .scan_for_header = true);
+    bool              pin    = false;
+    n00b_alloc_info_t direct = n00b_find_alloc_info(p,
+                                                    .scan_for_header = true,
+                                                    .pin             = &pin);
+    void             *base   = nullptr;
     if (direct.kind == n00b_alloc_inline) {
-        return (char *)direct.hdr.in_line + N00B_ALLOC_HDR_SZ;
+        base = (char *)direct.hdr.in_line + N00B_ALLOC_HDR_SZ;
     }
-    if (direct.kind == n00b_alloc_oob) {
-        return direct.hdr.oob->user_ptr;
+    else if (direct.kind == n00b_alloc_oob) {
+        base = direct.hdr.oob->user_ptr;
+    }
+    n00b_alloc_hdr_unpin(pin);
+    if (base != nullptr) {
+        return base;
     }
 
     uintptr_t addr = (uintptr_t)p;
@@ -279,11 +287,15 @@ recover_pool_base(void *p)
                        : 0;
 
     for (uintptr_t cand = addr; cand >= low; cand -= N00B_ALIGN) {
-        n00b_alloc_info_t info = n00b_find_alloc_info((void *)cand);
+        n00b_alloc_info_t info = n00b_find_alloc_info((void *)cand, .pin = &pin);
         if (info.kind == n00b_alloc_oob) {
             // OOB metadata is keyed by the exact base, so a hit means
             // `cand` is an allocation start.
-            return info.hdr.oob->user_ptr;
+            base = info.hdr.oob->user_ptr;
+        }
+        n00b_alloc_hdr_unpin(pin);
+        if (base != nullptr) {
+            return base;
         }
         if (cand < N00B_ALIGN) {
             break;
@@ -321,6 +333,16 @@ interpose_usable_from_info(n00b_alloc_info_t info)
     default:
         return 0;
     }
+}
+
+static size_t
+interpose_usable_at(void *base)
+{
+    bool   pin    = false;
+    size_t usable = interpose_usable_from_info(
+        n00b_find_alloc_info(base, .scan_for_header = true, .pin = &pin));
+    n00b_alloc_hdr_unpin(pin);
+    return usable;
 }
 
 // Page ranges of the live pages of every .libc_backing pool. While the runtime
@@ -681,9 +703,7 @@ n00b_interposed_realloc(void *ptr, size_t size)
         void *base = recover_pool_base(ptr);
         if (base) {
             size_t prefix = (size_t)((char *)ptr - (char *)base);
-            n00b_alloc_info_t info = n00b_find_alloc_info(
-                base, .scan_for_header = true);
-            size_t old = interpose_usable_from_info(info);
+            size_t old    = interpose_usable_at(base);
             old           = (old > prefix) ? old - prefix : 0;
 
             void *np = n00b_interposed_malloc(size);
@@ -832,9 +852,7 @@ n00b_interposed_malloc_usable_size(void *ptr)
         void *base = recover_pool_base(ptr);
         if (base) {
             size_t prefix = (size_t)((char *)ptr - (char *)base);
-            n00b_alloc_info_t info = n00b_find_alloc_info(
-                base, .scan_for_header = true);
-            size_t usable = interpose_usable_from_info(info);
+            size_t usable = interpose_usable_at(base);
             return usable > prefix ? usable - prefix : 0;
         }
     }
