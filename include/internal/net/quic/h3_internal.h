@@ -206,6 +206,9 @@ n00b_h3_client_init_uni_stream(n00b_h3_client_t          *client,
  * @internal
  * @brief Append @p bytes to a request's recv-buffer and try to parse
  *        as many frames as possible.
+ *
+ * Takes the request's lock, which guards everything the request's
+ * accessors read, the response body included.
  */
 extern n00b_result_t(bool)
 n00b_h3_request_feed(n00b_h3_request_t *req,
@@ -347,3 +350,29 @@ struct n00b_h3_server {
  */
 extern n00b_result_t(bool)
 n00b_h3_server_conn_drive(n00b_h3_server_conn_t *sconn);
+
+#ifdef N00B_DEBUG
+/**
+ * @internal
+ * @brief Windows in the H3 drivers where a debug hook can hold the driver
+ *        so a test can run another thread inside it.
+ */
+typedef enum : uint8_t {
+    N00B_H3_DEBUG_DRAINED,    /**< Client request drained, FIN not checked. */
+    N00B_H3_DEBUG_BODY_GROWN, /**< Body buffer grown, DATA not copied in. */
+} n00b_h3_debug_point_t;
+
+extern void (*_n00b_h3_debug_hook)(struct n00b_quic_chan *chan,
+                                   n00b_h3_debug_point_t  point);
+
+#define N00B_H3_DEBUG_POINT(chan, point)                                      \
+    do {                                                                      \
+        void (*_hdp_hook)(struct n00b_quic_chan *, n00b_h3_debug_point_t)     \
+            = _n00b_h3_debug_hook;                                            \
+        if (_hdp_hook != nullptr) {                                           \
+            _hdp_hook((chan), (point));                                       \
+        }                                                                     \
+    } while (0)
+#else
+#define N00B_H3_DEBUG_POINT(chan, point) ((void)0)
+#endif

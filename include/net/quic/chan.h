@@ -152,6 +152,12 @@ extern n00b_result_t(size_t)
  * 0 if no bytes are currently available.  This call does **not**
  * block; it always returns the bytes that are buffered at call time.
  *
+ * A channel has one reader.  This call, @c n00b_quic_chan_has_data,
+ * and @c n00b_quic_chan_recv_fin may run on any thread, including one
+ * other than the endpoint pump, but never on two threads at once for
+ * the same channel; serialize them, as the H3 drivers do under their
+ * drive lock.  Debug builds assert on a second concurrent reader.
+ *
  * @param chan Channel handle.
  * @param out  Destination buffer.
  * @param max  Maximum bytes to copy.
@@ -168,7 +174,8 @@ n00b_quic_chan_recv(n00b_quic_chan_t *chan, uint8_t *out, size_t max);
 /**
  * @brief Are there bytes available in the channel's recv buffer?
  *
- * Cheap predicate; useful in poll loops.
+ * Cheap predicate; useful in poll loops.  A reader call: see
+ * @c n00b_quic_chan_recv.
  *
  * @param chan Channel handle.
  * @return true iff at least one byte is buffered.
@@ -177,11 +184,12 @@ extern bool
 n00b_quic_chan_has_data(n00b_quic_chan_t *chan);
 
 /**
- * @brief Has the peer sent FIN on this channel?
+ * @brief Has the reader consumed everything up to the peer's FIN?
  *
- * After the peer FINs, recv may still drain remaining bytes (FIN
- * does not flush).  When recv returns 0 *and* `recv_fin` is true,
- * there is no more data coming.
+ * True once the peer has sent FIN and every byte it sent before the
+ * FIN has been read, so a true result means no more data is coming.
+ * Bytes still unread keep it false.  A reader call: see
+ * @c n00b_quic_chan_recv.
  */
 extern bool
 n00b_quic_chan_recv_fin(n00b_quic_chan_t *chan);

@@ -5,6 +5,7 @@
  */
 #pragma once
 
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include "n00b.h"
@@ -16,7 +17,9 @@ typedef struct st_picoquic_cnx_t picoquic_cnx_t;
 struct n00b_quic_conn {
     n00b_quic_endpoint_t *endpoint;     /**< Owning endpoint; borrowed. */
     picoquic_cnx_t       *cnx;          /**< picoquic connection context. */
-    n00b_quic_chan_t     *channels;     /**< Head of intrusive channel list. */
+    /* Head of the intrusive channel list.  Channels are only ever pushed,
+     * under endpoint->lock; readers walk it without a lock. */
+    _Atomic(n00b_quic_chan_t *) channels;
     n00b_quic_conn_t     *next_in_endpoint; /**< Server: link in endpoint->accepted list. */
     uint64_t              app_err;      /**< Last app close code we sent. */
     /* Close-reason metadata, captured when picoquic_callback_close /
@@ -40,7 +43,7 @@ struct n00b_quic_conn {
      * datagrams have no demux header, so the conn has at most one
      * DGRAM channel.  Lazily created the first time the app opens a
      * DGRAM channel OR the first time the peer sends a datagram. */
-    n00b_quic_chan_t     *dgram_chan;
+    _Atomic(n00b_quic_chan_t *) dgram_chan;
     bool                  client_mode;  /**< True for outbound; false for accepted. */
     bool                  closed;       /**< Local close called. */
 };
@@ -67,6 +70,8 @@ _n00b_quic_conn_find_chan(n00b_quic_conn_t *conn, uint64_t stream_id);
 /**
  * @internal
  * @brief Register a freshly opened channel onto its connection's list.
+ *
+ * The caller holds the connection's endpoint lock.
  */
 extern void
 _n00b_quic_conn_register_chan(n00b_quic_conn_t *conn, n00b_quic_chan_t *chan);

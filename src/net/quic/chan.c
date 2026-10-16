@@ -122,11 +122,15 @@ n00b_quic_chan_open(n00b_quic_conn_t *conn) _kargs
     chan->bytes_received = 0;
     chan->app_err_local  = 0;
     chan->app_err_peer   = 0;
-    chan->recv_buf       = nullptr;
+    atomic_store(&chan->rx_inbox, (n00b_quic_rx_chunk_t *)nullptr);
+    chan->rx_head        = nullptr;
+    chan->rx_tail        = nullptr;
     chan->sent_fin       = false;
-    chan->recv_fin       = false;
     chan->closed         = false;
     chan->last_activity_ns = (uint64_t)n00b_ns_timestamp();
+#ifdef N00B_DEBUG
+    atomic_store(&chan->rx_reader, 0);
+#endif
 
     /* Take the picoquic lock for the stream-id allocation +
      * eager-create.  Two concurrent chan_open calls without this
@@ -152,15 +156,18 @@ n00b_quic_chan_open(n00b_quic_conn_t *conn) _kargs
     rc = picoquic_add_to_stream(conn->cnx, chan->stream_id,
                                 nullptr, 0, /*set_fin*/ 0);
     n00b_allocator_scope_exit(&pico_scope);
+
+    /* Register on the connection's channel list so the per-cnx callback
+     * can route inbound stream events to us by stream ID.  The pump
+     * registers peer streams under this same lock. */
+    if (rc == 0) {
+        _n00b_quic_conn_register_chan(conn, chan);
+    }
     n00b_data_unlock(conn->endpoint->lock);
     if (rc != 0) {
         return n00b_result_err(n00b_quic_chan_t *,
                                N00B_QUIC_ERR_PROTOCOL);
     }
-
-    /* Register on the connection's channel list so the per-cnx callback
-     * can route inbound stream events to us by stream ID. */
-    _n00b_quic_conn_register_chan(conn, chan);
 
     chan_metrics_on_open(chan);
     return n00b_result_ok(n00b_quic_chan_t *, chan);
@@ -300,11 +307,15 @@ _n00b_quic_chan_accept_internal(n00b_quic_conn_t *conn, uint64_t stream_id)
     chan->bytes_received = 0;
     chan->app_err_local  = 0;
     chan->app_err_peer   = 0;
-    chan->recv_buf       = nullptr;
+    atomic_store(&chan->rx_inbox, (n00b_quic_rx_chunk_t *)nullptr);
+    chan->rx_head        = nullptr;
+    chan->rx_tail        = nullptr;
     chan->sent_fin       = false;
-    chan->recv_fin       = false;
     chan->closed         = false;
     chan->last_activity_ns = (uint64_t)n00b_ns_timestamp();
+#ifdef N00B_DEBUG
+    atomic_store(&chan->rx_reader, 0);
+#endif
 
     _n00b_quic_conn_register_chan(conn, chan);
     return chan;
@@ -380,20 +391,137 @@ n00b_quic_chan_send(n00b_quic_chan_t *chan,
     chan->last_activity_ns  = (uint64_t)n00b_ns_timestamp();
     if (fin) {
         chan->sent_fin = true;
-        /* If we were OPEN, we're now SEND_HALF_CLOSED.  If we were
-         * RECV_HALF_CLOSED already, finning closes the channel. */
-        if (chan->state == N00B_QUIC_CHAN_STATE_RECV_HALF_CLOSED) {
-            chan->state = N00B_QUIC_CHAN_STATE_CLOSED;
-        } else {
-            chan->state = N00B_QUIC_CHAN_STATE_SEND_HALF_CLOSED;
-        }
+        (void)_n00b_quic_chan_transition(chan, N00B_QUIC_CHAN_EV_LOCAL_FIN);
     }
     return n00b_result_ok(size_t, len);
 }
 
 /* ===========================================================================
+ * State transitions
+ * =========================================================================== */
+
+static n00b_quic_chan_state_t
+chan_next_state(n00b_quic_chan_state_t cur, n00b_quic_chan_event_t ev)
+{
+    switch (ev) {
+    case N00B_QUIC_CHAN_EV_LOCAL_FIN:
+        if (cur == N00B_QUIC_CHAN_STATE_RECV_HALF_CLOSED) {
+            return N00B_QUIC_CHAN_STATE_CLOSED;
+        }
+        if (cur == N00B_QUIC_CHAN_STATE_OPEN) {
+            return N00B_QUIC_CHAN_STATE_SEND_HALF_CLOSED;
+        }
+        return cur;
+    case N00B_QUIC_CHAN_EV_PEER_FIN:
+        if (cur == N00B_QUIC_CHAN_STATE_SEND_HALF_CLOSED) {
+            return N00B_QUIC_CHAN_STATE_CLOSED;
+        }
+        if (cur == N00B_QUIC_CHAN_STATE_OPEN) {
+            return N00B_QUIC_CHAN_STATE_RECV_HALF_CLOSED;
+        }
+        return cur;
+    case N00B_QUIC_CHAN_EV_LOCAL_RESET:
+        return N00B_QUIC_CHAN_STATE_LOCAL_RESET;
+    case N00B_QUIC_CHAN_EV_PEER_RESET:
+        return N00B_QUIC_CHAN_STATE_PEER_RESET;
+    case N00B_QUIC_CHAN_EV_CLOSE:
+        if (cur == N00B_QUIC_CHAN_STATE_LOCAL_RESET || cur == N00B_QUIC_CHAN_STATE_PEER_RESET) {
+            return cur;
+        }
+        return N00B_QUIC_CHAN_STATE_CLOSED;
+    }
+    return cur;
+}
+
+n00b_quic_chan_state_t
+_n00b_quic_chan_transition(n00b_quic_chan_t *chan, n00b_quic_chan_event_t ev)
+{
+    n00b_quic_chan_state_t cur = atomic_load(&chan->state);
+    n00b_quic_chan_state_t next;
+
+    do {
+        next = chan_next_state(cur, ev);
+        if (next == cur) {
+            return cur;
+        }
+        N00B_QUIC_DEBUG_POINT(chan->conn, chan, N00B_QUIC_DEBUG_TRANSITION);
+    } while (!atomic_compare_exchange_weak(&chan->state, &cur, next));
+    return next;
+}
+
+/* ===========================================================================
  * Recv — internal append + public pull
  * =========================================================================== */
+
+#ifdef N00B_DEBUG
+void (*_n00b_quic_debug_hook)(n00b_quic_conn_t       *conn,
+                              n00b_quic_chan_t       *chan,
+                              n00b_quic_debug_point_t point) = nullptr;
+
+// Holds the id of the thread inside a reader call, so a second reader on
+// another thread trips the assert.  Returns whether this call took it.
+static bool
+rx_reader_enter(n00b_quic_chan_t *chan)
+{
+    int64_t self = (int64_t)n00b_self_os_id();
+    int64_t held = 0;
+
+    if (atomic_compare_exchange_strong(&chan->rx_reader, &held, self)) {
+        return true;
+    }
+    n00b_assert(held == self && "a QUIC channel allows one reader at a time");
+    return false;
+}
+
+static void
+rx_reader_exit(n00b_quic_chan_t *chan, bool entered)
+{
+    if (entered) {
+        atomic_store(&chan->rx_reader, 0);
+    }
+}
+
+#define RX_READER_ENTER(chan) bool rx_entered_ = rx_reader_enter(chan)
+#define RX_READER_EXIT(chan)  rx_reader_exit((chan), rx_entered_)
+#else
+#define RX_READER_ENTER(chan) ((void)0)
+#define RX_READER_EXIT(chan)  ((void)0)
+#endif
+
+static n00b_quic_rx_chunk_t *
+rx_chunk_new(const uint8_t *bytes, size_t len)
+{
+    n00b_allocator_t     *alloc = (n00b_allocator_t *)&n00b_get_runtime()->conduit_pool;
+    n00b_quic_rx_chunk_t *chunk = (n00b_quic_rx_chunk_t *)n00b_alloc_array_with_opts(
+        uint8_t,
+        sizeof(n00b_quic_rx_chunk_t) + len,
+        &(n00b_alloc_opts_t){.allocator = alloc});
+
+    chunk->next = nullptr;
+    chunk->len  = len;
+    chunk->off  = 0;
+    chunk->fin  = false;
+    if (bytes) {
+        memcpy(chunk->bytes, bytes, len);
+    }
+    else {
+        memset(chunk->bytes, 0, len);
+    }
+    return chunk;
+}
+
+static void
+rx_publish(n00b_quic_chan_t *chan, n00b_quic_rx_chunk_t *chunk)
+{
+    n00b_quic_rx_chunk_t *head = atomic_load_explicit(&chan->rx_inbox, memory_order_relaxed);
+    do {
+        chunk->next = head;
+    } while (!atomic_compare_exchange_weak_explicit(&chan->rx_inbox,
+                                                    &head,
+                                                    chunk,
+                                                    memory_order_release,
+                                                    memory_order_relaxed));
+}
 
 void
 _n00b_quic_chan_append_recv(n00b_quic_chan_t *chan,
@@ -403,20 +531,82 @@ _n00b_quic_chan_append_recv(n00b_quic_chan_t *chan,
     if (!chan || len == 0) {
         return;
     }
-    if (!chan->recv_buf) {
-        n00b_allocator_t *alloc =
-            (n00b_allocator_t *)&n00b_get_runtime()->conduit_pool;
-        chan->recv_buf = n00b_buffer_empty(.allocator = alloc);
-    }
-    size_t old = chan->recv_buf->byte_len;
-    n00b_buffer_resize(chan->recv_buf, old + len);
-    if (bytes) {
-        memcpy(chan->recv_buf->data + old, bytes, len);
-    } else {
-        memset(chan->recv_buf->data + old, 0, len);
-    }
+
+    n00b_quic_rx_chunk_t *chunk = rx_chunk_new(bytes, len);
+    N00B_QUIC_DEBUG_POINT(chan->conn, chan, N00B_QUIC_DEBUG_PUBLISH);
+    rx_publish(chan, chunk);
+
     chan->bytes_received   += len;
     chan->last_activity_ns  = (uint64_t)n00b_ns_timestamp();
+}
+
+void
+_n00b_quic_chan_append_fin(n00b_quic_chan_t *chan)
+{
+    if (!chan) {
+        return;
+    }
+
+    n00b_quic_rx_chunk_t *chunk = rx_chunk_new(nullptr, 0);
+    chunk->fin                  = true;
+    rx_publish(chan, chunk);
+}
+
+// Move everything the pump has published onto the reader's list, oldest
+// first.  Reader-only.
+static void
+rx_collect(n00b_quic_chan_t *chan)
+{
+    n00b_quic_rx_chunk_t *newest = atomic_exchange_explicit(&chan->rx_inbox,
+                                                            (n00b_quic_rx_chunk_t *)nullptr,
+                                                            memory_order_acquire);
+    n00b_quic_rx_chunk_t *oldest = nullptr;
+
+    while (newest != nullptr) {
+        n00b_quic_rx_chunk_t *next = newest->next;
+        newest->next               = oldest;
+        oldest                     = newest;
+        newest                     = next;
+    }
+    if (oldest == nullptr) {
+        return;
+    }
+    if (chan->rx_tail != nullptr) {
+        chan->rx_tail->next = oldest;
+    }
+    else {
+        chan->rx_head = oldest;
+    }
+    while (oldest->next != nullptr) {
+        oldest = oldest->next;
+    }
+    chan->rx_tail = oldest;
+}
+
+// True when the reader's next chunk holds bytes rather than the FIN.
+// Reader-only.
+static bool
+rx_has_bytes(n00b_quic_chan_t *chan)
+{
+    rx_collect(chan);
+    return chan->rx_head != nullptr && !chan->rx_head->fin;
+}
+
+void
+_n00b_quic_chan_unread(n00b_quic_chan_t *chan, const uint8_t *bytes, size_t len)
+{
+    if (!chan || len == 0) {
+        return;
+    }
+
+    RX_READER_ENTER(chan);
+    n00b_quic_rx_chunk_t *chunk = rx_chunk_new(bytes, len);
+    chunk->next                 = chan->rx_head;
+    chan->rx_head               = chunk;
+    if (chan->rx_tail == nullptr) {
+        chan->rx_tail = chunk;
+    }
+    RX_READER_EXIT(chan);
 }
 
 n00b_result_t(size_t)
@@ -436,28 +626,44 @@ n00b_quic_chan_recv(n00b_quic_chan_t *chan, uint8_t *out, size_t max)
     if (!out) {
         return n00b_result_err(size_t, N00B_QUIC_ERR_NULL_ARG);
     }
-    if (!chan->recv_buf || chan->recv_buf->byte_len == 0) {
-        return n00b_result_ok(size_t, 0);
-    }
 
-    size_t have = chan->recv_buf->byte_len;
-    size_t n    = have < max ? have : max;
-    memcpy(out, chan->recv_buf->data, n);
+    RX_READER_ENTER(chan);
+    rx_collect(chan);
+    N00B_QUIC_DEBUG_POINT(chan->conn, chan, N00B_QUIC_DEBUG_READ);
 
-    /* Shift the remaining bytes down.  The recv buffer is small in
-     * practice (per-stream); a memmove on every recv is fine. */
-    if (have > n) {
-        memmove(chan->recv_buf->data, chan->recv_buf->data + n, have - n);
+    size_t n = 0;
+    while (n < max && chan->rx_head != nullptr && !chan->rx_head->fin) {
+        n00b_quic_rx_chunk_t *chunk = chan->rx_head;
+        size_t                take  = chunk->len - chunk->off;
+        if (take > max - n) {
+            take = max - n;
+        }
+        memcpy(out + n, chunk->bytes + chunk->off, take);
+        chunk->off += take;
+        n          += take;
+        if (chunk->off == chunk->len) {
+            chan->rx_head = chunk->next;
+            if (chan->rx_head == nullptr) {
+                chan->rx_tail = nullptr;
+            }
+            n00b_free(chunk);
+        }
     }
-    n00b_buffer_resize(chan->recv_buf, have - n);
+    RX_READER_EXIT(chan);
     return n00b_result_ok(size_t, n);
 }
 
 bool
 n00b_quic_chan_has_data(n00b_quic_chan_t *chan)
 {
-    return chan && !chan->closed
-           && chan->recv_buf && chan->recv_buf->byte_len > 0;
+    if (!chan || chan->closed) {
+        return false;
+    }
+
+    RX_READER_ENTER(chan);
+    bool has = rx_has_bytes(chan);
+    RX_READER_EXIT(chan);
+    return has;
 }
 
 /* ===========================================================================
@@ -509,7 +715,15 @@ n00b_quic_chan_recv_dgram(n00b_quic_chan_t *chan)
 bool
 n00b_quic_chan_recv_fin(n00b_quic_chan_t *chan)
 {
-    return chan && chan->recv_fin;
+    if (!chan) {
+        return false;
+    }
+
+    RX_READER_ENTER(chan);
+    rx_collect(chan);
+    bool fin = chan->rx_head != nullptr && chan->rx_head->fin;
+    RX_READER_EXIT(chan);
+    return fin;
 }
 
 /* ===========================================================================
@@ -534,7 +748,7 @@ n00b_quic_chan_reset(n00b_quic_chan_t *chan, uint64_t app_err)
         return n00b_result_err(bool, N00B_QUIC_ERR_PROTOCOL);
     }
     chan->app_err_local = app_err;
-    chan->state         = N00B_QUIC_CHAN_STATE_LOCAL_RESET;
+    (void)_n00b_quic_chan_transition(chan, N00B_QUIC_CHAN_EV_LOCAL_RESET);
     return n00b_result_ok(bool, true);
 }
 
@@ -578,9 +792,6 @@ n00b_quic_chan_close(n00b_quic_chan_t *chan)
         chan->sent_fin = true;
     }
     chan->closed = true;
-    if (chan->state != N00B_QUIC_CHAN_STATE_LOCAL_RESET &&
-        chan->state != N00B_QUIC_CHAN_STATE_PEER_RESET) {
-        chan->state = N00B_QUIC_CHAN_STATE_CLOSED;
-    }
+    (void)_n00b_quic_chan_transition(chan, N00B_QUIC_CHAN_EV_CLOSE);
     chan_metrics_on_close(chan);
 }

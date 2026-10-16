@@ -48,6 +48,10 @@
 #include "internal/net/quic/h3_internal.h"
 #include "internal/net/quic/chan_internal.h"
 
+#ifdef N00B_DEBUG
+void (*_n00b_h3_debug_hook)(struct n00b_quic_chan *chan, n00b_h3_debug_point_t point) = nullptr;
+#endif
+
 /* ===========================================================================
  * Allocation helpers (conduit_pool throughout)
  * =========================================================================== */
@@ -895,6 +899,7 @@ process_request_frame(n00b_h3_request_t      *req,
 
             n00b_buffer_resize(req->resp_body,
                                 (uint64_t)(old + frame->body_len));
+            N00B_H3_DEBUG_POINT(req->chan, N00B_H3_DEBUG_BODY_GROWN);
             memcpy((uint8_t *)req->resp_body->data + old,
                     frame->body, frame->body_len);
         }
@@ -908,16 +913,12 @@ process_request_frame(n00b_h3_request_t      *req,
     return n00b_result_ok(bool, true);
 }
 
-n00b_result_t(bool)
-n00b_h3_request_feed(n00b_h3_request_t *req,
-                     const uint8_t     *bytes,
-                     size_t             len,
-                     bool               fin)
+static n00b_result_t(bool)
+request_feed_locked(n00b_h3_request_t *req,
+                    const uint8_t     *bytes,
+                    size_t             len,
+                    bool               fin)
 {
-    if (!req) {
-        return n00b_result_err(bool, N00B_QUIC_ERR_NULL_ARG);
-    }
-
     /* Already terminal (DONE or RESET): silently drop the bytes.
      * Defensive against late arrivals after a body-cap trip; without
      * this guard `drive_request_streams` could re-enter feed for a
@@ -964,6 +965,24 @@ n00b_h3_request_feed(n00b_h3_request_t *req,
         }
     }
     return n00b_result_ok(bool, true);
+}
+
+n00b_result_t(bool)
+n00b_h3_request_feed(n00b_h3_request_t *req,
+                     const uint8_t     *bytes,
+                     size_t             len,
+                     bool               fin)
+{
+    if (!req) {
+        return n00b_result_err(bool, N00B_QUIC_ERR_NULL_ARG);
+    }
+
+    // The accessors, n00b_h3_request_consume_body among them, read this
+    // request's state under the same lock from other threads.
+    n00b_data_write_lock(req->lock);
+    n00b_result_t(bool) r = request_feed_locked(req, bytes, len, fin);
+    n00b_data_unlock(req->lock);
+    return r;
 }
 
 /* ===========================================================================
@@ -1196,12 +1215,9 @@ discover_peer_uni_streams(n00b_h3_client_t *client)
                 (uint64_t)N00B_H3_ERR_STREAM_CREATION);
             break;
         }
-        /* Any leftover bytes from the varint slice belong to the
-         * stream's actual payload — push them back via
-         * _n00b_quic_chan_append_recv so the regular drive path
-         * picks them up. */
+        // The bytes read past the varint go back in front of the rest.
         if ((size_t)vn < got) {
-            _n00b_quic_chan_append_recv(c, tmp + vn, got - (size_t)vn);
+            _n00b_quic_chan_unread(c, tmp + vn, got - (size_t)vn);
         }
         c = nx;
     }
@@ -1242,6 +1258,7 @@ drive_request_streams(n00b_h3_client_t *client)
         if (req->state == N00B_H3_REQ_STATE_RESET) {
             continue;
         }
+        N00B_H3_DEBUG_POINT(req->chan, N00B_H3_DEBUG_DRAINED);
         bool peer_fin = n00b_quic_chan_recv_fin(req->chan);
         if (peer_fin && !req->peer_fin_seen) {
             (void)n00b_h3_request_feed(req, nullptr, 0, true);
