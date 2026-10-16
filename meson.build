@@ -1763,6 +1763,24 @@ env_test = executable('test_env',
 )
 test('env', env_test, suite: 'unit')
 
+pool_plain_free_test = executable('test_pool_plain_free',
+    ['test/unit/test_pool_plain_free.c'],
+    kwargs: test_common_kwargs,
+)
+test('pool_plain_free', pool_plain_free_test, suite: 'unit')
+
+data_lock_null_sites_test = executable('test_data_lock_null_sites',
+    ['test/unit/test_data_lock_null_sites.c'],
+    kwargs: test_common_kwargs,
+)
+test('data_lock_null_sites', data_lock_null_sites_test, suite: 'unit')
+
+data_lock_reclaim_test = executable('test_data_lock_reclaim',
+    ['test/unit/test_data_lock_reclaim.c'],
+    kwargs: test_common_kwargs,
+)
+test('data_lock_reclaim', data_lock_reclaim_test, suite: 'unit')
+
 http_client_plain_test = executable('test_http_client_plain',
     ['test/unit/test_http_client_plain.c'],
     kwargs: test_common_kwargs,
@@ -2108,51 +2126,21 @@ rocs_index_test = executable('test_rocs_index',
 )
 test('rocs_index', rocs_index_test, suite: 'unit')
 
-# n00b#496: the hang only appears when the emitter is a real SUBPROCESS whose
-# pipe n00b's own conduit drains -- the in-process test_print_contention never
-# reproduces it. Registered in 'known-broken' for the same reason that test is:
-# it passes every assertion it makes, and then the process dies in teardown on
-# n00b#409 (subscription.c:139 / conduit.h:170, "lock not initialized"), which
-# is not this test's defect. Run it on demand with:
-#     meson test --suite known-broken print_sync_subproc
 print_sync_subproc_test = executable('test_print_sync_subproc',
     ['test/unit/test_print_sync_subproc.c'],
     kwargs: test_common_kwargs,
 )
 test('print_sync_subproc', print_sync_subproc_test,
-     suite: 'known-broken', is_parallel: false, timeout: 300)
+     suite: 'unit', is_parallel: false, timeout: 300)
 
 
 print_contention_test = executable('test_print_contention',
     ['test/unit/test_print_contention.c'],
     kwargs: test_common_kwargs,
 )
-# 'known-broken', not 'unit': this test PASSES every assertion it makes on
-# all three platforms, and then the process dies for reasons that are not
-# its own.
-#
-#   macOS / Linux: "All print contention tests passed", then SIGABRT in
-#     n00b_shutdown -> n00b_conduit_destroy -> topic_notify_all with
-#     conduit.h:170 "Lock ... was not initialized before use" -- n00b#409.
-#     This test reproduces that at ~40% (vs 0/15 for test_print), because
-#     threads that print and then exit are its trigger; it did not create
-#     the defect and cannot avoid it while asserting what it asserts.
-#   Windows: the drained arm never finishes, which is the n00b#496 hang
-#     this test was written to catch. That is a RESULT, not a flake, and
-#     quarantining it is not an admission it is wrong -- it is the finding
-#     parked where it does not red the gate for everyone else.
-#
-# 'known-broken' rather than should_fail, for the reason rocs_live_cursor
-# gives above: the POSIX outcome is a pass followed by an abort, so
-# should_fail would report UNEXPECTEDPASS on the assertions and leave the
-# gate red either way.
-#
-# Restore to 'unit' when n00b#409 is fixed (POSIX) and n00b#496 is fixed or
-# the Windows arm is scoped out. Run it on demand with:
-#     meson test --suite known-broken print_contention
 test('print_contention',
      print_contention_test,
-     suite: 'known-broken',
+     suite: 'unit',
      timeout: 300)
 
 rocs_fulltext_index_test = executable('test_rocs_fulltext_index',
@@ -4523,6 +4511,18 @@ fd_owner_read_all_test = executable('test_fd_owner_read_all',
     kwargs: test_common_kwargs,
 )
 test('fd_owner_read_all', fd_owner_read_all_test, suite: 'unit')
+
+early_topic_locks_test = executable('test_early_topic_locks',
+    ['test/unit/test_early_topic_locks.c'],
+    kwargs: test_common_kwargs,
+)
+test('early_topic_locks', early_topic_locks_test, suite: 'unit')
+
+gc_roots_lock_test = executable('test_gc_roots_lock',
+    ['test/unit/test_gc_roots_lock.c'],
+    kwargs: test_common_kwargs,
+)
+test('gc_roots_lock', gc_roots_lock_test, suite: 'unit')
 
 # ============================================================================
 # Regex engine tests — registered via subdir during Phase 11 of the regex port.

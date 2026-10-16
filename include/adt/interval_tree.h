@@ -201,9 +201,14 @@ typedef struct n00b_interval_range {
  * @param alloc_arg Optional allocator (nullptr = runtime default).
  */
 #define n00b_interval_tree_init(tree, ...)                                                     \
-    _n00b_interval_tree_init_impl(tree, ##__VA_ARGS__)
+    _n00b_interval_tree_init_impl(tree, true, ##__VA_ARGS__)
 
-#define _n00b_interval_tree_init_impl(tree, ...)                                               \
+/// @brief Initialize an interval tree with no rwlock, for a caller that
+/// guards it with a lock of its own.
+#define n00b_interval_tree_init_private(tree, ...)                                             \
+    _n00b_interval_tree_init_impl(tree, false, ##__VA_ARGS__)
+
+#define _n00b_interval_tree_init_impl(tree, locked, ...)                                       \
     do {                                                                                       \
         auto _iti_t = (tree);                                                                  \
         n00b_alloc_opts_t _iti_o = (n00b_alloc_opts_t){__VA_ARGS__};                           \
@@ -218,7 +223,8 @@ typedef struct n00b_interval_range {
         _iti_t->scan_kind = _iti_o.scan_kind;                                                  \
         _iti_t->scan_cb   = _iti_o.scan_cb;                                                    \
         _iti_t->scan_user = _iti_o.scan_user;                                                  \
-        _iti_t->lock = n00b_data_lock_new(.allocator = _iti_t->allocator);                     \
+        _iti_t->lock = (locked) ? n00b_data_lock_new(.allocator = _iti_t->allocator)           \
+                                : (n00b_rwlock_t *)nullptr;                                    \
     } while (0)
 
 // ============================================================================

@@ -1031,10 +1031,11 @@ n00b_mmaps_initialize(n00b_mmap_ctx_t *ctx)
     n00b_allocator_t  *alloc = (n00b_allocator_t *)&ctx->pool;
     n00b_alloc_opts_t  aopts = { .allocator = alloc };
 
+    // ctx->lock guards both trees.
     ctx->mmap_tree = n00b_alloc_with_opts(mmap_tree_t, &aopts);
-    n00b_interval_tree_init(ctx->mmap_tree, .allocator = alloc);
+    n00b_interval_tree_init_private(ctx->mmap_tree, .allocator = alloc);
     ctx->range_tree = n00b_alloc_with_opts(mmap_tree_t, &aopts);
-    n00b_interval_tree_init(ctx->range_tree, .allocator = alloc);
+    n00b_interval_tree_init_private(ctx->range_tree, .allocator = alloc);
 
     n00b_load_static_ranges();
 }

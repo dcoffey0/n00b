@@ -320,11 +320,7 @@ _n00b_conduit_local_xpc_stage_queue_destroy(void *raw_queue)
 
     local_xpc_stage_queue_t *queue = raw_queue;
     _n00b_conduit_local_xpc_stage_queue_drop(raw_queue);
-    n00b_rwlock_t *lock = queue->lock;
     n00b_list_free(*queue);
-    if (lock != nullptr) {
-        n00b_free(lock);
-    }
     n00b_free(queue);
 }
 

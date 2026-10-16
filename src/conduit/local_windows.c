@@ -506,11 +506,7 @@ local_windows_accept_queue_free(local_windows_accept_queue_t *queue)
         return;
     }
 
-    n00b_rwlock_t *lock = queue->lock;
     n00b_list_free(*queue);
-    if (lock != nullptr) {
-        n00b_free(lock);
-    }
     n00b_free(queue);
 }
 

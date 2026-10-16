@@ -53,7 +53,7 @@ test_canvas_init_caller_owned_storage(void)
     assert(canvas.frame_rows == 25);
     assert(canvas.frame_cols == 80);
 
-    n00b_canvas_destroy(&canvas);
+    n00b_canvas_deinit(&canvas);
     printf("  [PASS] canvas init resets caller-owned storage\n");
 }
 

@@ -18,6 +18,8 @@
 #include "core/thread.h"
 #include "core/epoch.h"
 #include "core/stw.h"
+#include "core/syscall.h"
+#include <stdlib.h>
 #include "core/gc.h"
 
 #ifndef N00B_METADATA_START_ENTRIES
@@ -1109,6 +1111,29 @@ n00b_free(void *ptr) _kargs {
     // .allocator instead.)
     n00b_allocator_opt_t alloc_opt = n00b_mem_get_allocator(ptr);
 
+    if (!n00b_option_is_set(alloc_opt) && ptr != nullptr) {
+        // Hidden pools keep their pages out of the tree, but each allocation
+        // names its pool in its header.
+        n00b_allocator_t *pool = n00b_pool_unlisted_owner(ptr);
+        if (pool != nullptr) {
+            n00b_free_storage_from_allocator(pool, ptr);
+            return;
+        }
+        // An arena that stays out of the tree frees nothing singly, and its
+        // allocations carry the inline header.
+        if (n00b_option_is_set(n00b_inline_alloc_header(ptr))) {
+            return;
+        }
+#ifdef N00B_DEBUG
+        // Nothing owns it, so there is nothing to free it to, and a silent
+        // return would hide a leak or a bad pointer. The report is raw
+        // because formatting one frees, which would come back here.
+        static const char msg[] = "n00b_free: no allocator owns this pointer\n";
+        n00b_raw_write_all_brief(2, msg, sizeof msg - 1);
+        abort();
+#endif
+        return;
+    }
     if (!n00b_option_is_set(alloc_opt)) {
         return;
     }
