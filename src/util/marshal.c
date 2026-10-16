@@ -16,6 +16,7 @@
 #include "core/memory_info.h"
 #include "core/mmaps.h"
 #include "core/pool.h"
+#include "core/rwlock.h"
 #include "core/runtime.h"
 #include "core/static_objects.h"
 #include "core/stw.h"
@@ -1887,6 +1888,26 @@ emit_cbscan(n00b_marshal_ctx_t *ctx, n00b_marshal_node_t *node)
     return true;
 }
 
+// A lock never enters a marshal image (n00b#557, n00b#558). It is runtime
+// state the process owns: copying the pointer leaves the copy sharing the
+// original's lock in this process and pointing at nothing in another, and
+// copying the lock would copy whoever holds it. Containers allocate their lock
+// as its own n00b_rwlock_t, so the allocation's type says which targets are
+// locks. A pointer to one marshals as null, and an unmarshalled container
+// comes back unlocked (private).
+static inline bool
+marshal_target_is_lock(n00b_alloc_info_t info)
+{
+    uint64_t tinfo = 0;
+    if (info.kind == n00b_alloc_oob) {
+        tinfo = info.hdr.oob->tinfo;
+    }
+    else if (info.kind == n00b_alloc_inline) {
+        tinfo = info.hdr.in_line->tinfo;
+    }
+    return tinfo != 0 && tinfo == typehash(n00b_rwlock_t *);
+}
+
 // Add the resolved target allocation to the marshal graph and rewrite the
 // pointer word in `words[i]` to its virtual address.  Returns false on error
 // (the caller must propagate by returning).  Shared by the home-allocator fast
@@ -1898,6 +1919,11 @@ marshal_resolve_and_rewrite(n00b_marshal_ctx_t *ctx,
                             uint64_t            word,
                             n00b_alloc_info_t   info)
 {
+    if (marshal_target_is_lock(info)) {
+        words[i] = 0;
+        return true;
+    }
+
     n00b_marshal_node_t *target = marshal_add_alloc(ctx, info);
     if (!target) {
         return false;

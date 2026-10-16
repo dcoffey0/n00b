@@ -2384,6 +2384,21 @@ test('gc_pinref_root_copying', gc_pinref_root_test, suite: 'unit',
 test('gc_pinref_root_pin_all', gc_pinref_root_test, suite: 'unit',
     env: {'N00B_GC_PIN_ALL': '1'})
 
+gc_list_lock_relocation_test = executable('test_gc_list_lock_relocation',
+    ['test/unit/test_gc_list_lock_relocation.c'],
+    kwargs: test_common_kwargs,
+)
+test('gc_list_lock_relocation_copying', gc_list_lock_relocation_test, suite: 'unit',
+    env: {'N00B_GC_PIN_ALL': '0'})
+test('gc_list_lock_relocation_pin_all', gc_list_lock_relocation_test, suite: 'unit',
+    env: {'N00B_GC_PIN_ALL': '1'})
+
+marshal_container_lock_test = executable('test_marshal_container_lock',
+    ['test/unit/test_marshal_container_lock.c'],
+    kwargs: test_common_kwargs,
+)
+test('marshal_container_lock', marshal_container_lock_test, suite: 'unit')
+
 bench_rocs_catalog_rewrite = executable('bench_rocs_catalog_rewrite',
     ['test/unit/bench_rocs_catalog_rewrite.c'],
     kwargs: test_common_kwargs,

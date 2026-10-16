@@ -36,7 +36,7 @@ env:
   # Pinned to build.sh's NCC_REV_DEFAULT. These MUST move together: n00b sources
   # are compiled by ncc, so a drifting ncc silently changes the compiler under
   # the test suite. If you bump one, bump the other in the same commit.
-  NCC_REV: 7ab04e7079741fcbffab87f039c39970d2b8724b
+  NCC_REV: eb53eb46b95a24b9ed49c3fba9b64407c9db7bbc
   # debugoptimized, not debug: -O0 leaves every `static inline` as a real call,
   # and ncc wraps every libn00b function in a gc-stack-map push/pop pair that
   # each re-runs the TLS-free n00b_thread_self() recovery. A perf profile of
