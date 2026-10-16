@@ -830,18 +830,18 @@ n00b_mmap_search_smallest_map(mmap_node_t *node,
     return result;
 }
 
-#if defined(N00B_DEBUG)
-// Point searches of the registry, for tests that bound how often a path
-// consults it.
-_Atomic(uint64_t) n00b_mmap_point_searches = 0;
-#endif
+// Point searches of the registry, counted while a test sets
+// n00b_mmap_count_point_searches, so tests can bound how often a path
+// consults it without every search paying for a shared counter.
+_Atomic(bool)     n00b_mmap_count_point_searches = false;
+_Atomic(uint64_t) n00b_mmap_point_searches       = 0;
 
 [[n00b::nogc]] static mmap_node_t *
 n00b_mmap_search_point(mmap_tree_t *tree, uint64_t start, uint64_t end)
 {
-#if defined(N00B_DEBUG)
-    atomic_fetch_add_explicit(&n00b_mmap_point_searches, 1, memory_order_relaxed);
-#endif
+    if (atomic_load_explicit(&n00b_mmap_count_point_searches, memory_order_relaxed)) {
+        atomic_fetch_add_explicit(&n00b_mmap_point_searches, 1, memory_order_relaxed);
+    }
     bool         locked     = n00b_mmap_tree_needs_lock();
     mmap_node_t *result     = nullptr;
     uint64_t     result_len = (uint64_t)-1;

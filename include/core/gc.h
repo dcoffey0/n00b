@@ -312,19 +312,42 @@ typedef struct {
 } n00b_gc_wl_item_t;
 
 /**
+ * @brief A pointer-keyed table the collector keeps for one collection.
+ *
+ * Open-addressed and used only by the collecting thread while the world is
+ * stopped, so a lookup takes no lock or epoch and pushes no stack-map frame.
+ * Keys are never null; a null key marks an empty slot. Storage comes from
+ * `allocator` and is freed with it.
+ */
+typedef struct {
+    void            **keys;
+    void            **values;
+    n00b_allocator_t *allocator;
+    uint64_t          count;
+    uint32_t          shift; // 64 - log2(capacity)
+} n00b_gc_ptr_table_t;
+
+extern void  n00b_gc_ptr_table_init(n00b_gc_ptr_table_t *t,
+                                    n00b_allocator_t    *allocator,
+                                    uint32_t             log2_capacity);
+extern void *n00b_gc_ptr_table_get(n00b_gc_ptr_table_t *t, void *key, bool *found);
+extern void  n00b_gc_ptr_table_put(n00b_gc_ptr_table_t *t, void *key, void *value);
+
+/**
  * @brief Per-collection memo of the conservative backward guard scan.
  *
  * Maps each 256-byte line a backward guard scan has crossed to the nearest
- * guard below it, so a later scan stops at the first such line it reaches and
- * each line is scanned once per memo. Valid only while no guard word in the
- * memoized mappings is written or erased, which holds for registered arena
- * segments and pool pages while the world is stopped.
+ * guard below it, or to the bottom of the guard-free range below it, so a
+ * later scan stops at the first such line it reaches and each line is scanned
+ * once per memo. Four bytes per line, so at most 1/64 of the memory scanned.
+ * Valid only while no guard word in the memoized mappings is written or
+ * erased, which holds for registered arena segments and pool pages while the
+ * world is stopped, except the ranges the collector itself writes.
  */
 typedef struct {
-    n00b_dict_untyped_t pages;     // page base -> uint64_t[page / 256] lines
-    n00b_allocator_t   *allocator; // line arrays; freed with it
+    n00b_gc_ptr_table_t pages;     // page base -> uint32_t[page / 256] lines
     uintptr_t           last_page; // most recent `pages` lookup
-    uint64_t           *last_lines;
+    uint32_t           *last_lines;
 } n00b_guard_memo_t;
 
 /**
@@ -348,7 +371,9 @@ typedef struct {
     n00b_arena_t                     *to_space;
     n00b_pool_t                       work_pool;
     n00b_list_t(n00b_gc_wl_item_t *)  worklist;
-    n00b_dict_untyped_t               memos;
+    /* Objects this collection has reached, keyed by header or static range,
+     * with each one's forward location. */
+    n00b_gc_ptr_table_t               visited;
     /* The runtime's gc_current_epoch value snapshotted at
      * collection start. The mark phase stamps this onto every
      * metadata-bearing alloc it reaches via the OOB record's

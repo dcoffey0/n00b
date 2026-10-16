@@ -144,7 +144,7 @@ typedef struct n00b_alloc_info_t {
  * @param info Allocation info to query.
  * @return     Optional OOB header pointer.
  */
-static inline n00b_option_t(n00b_oob_hdr_t *)
+[[n00b::nogc]] static inline n00b_option_t(n00b_oob_hdr_t *)
 n00b_alloc_info_oob(n00b_alloc_info_t info)
 {
     if (info.kind != n00b_alloc_oob) {
@@ -158,7 +158,7 @@ n00b_alloc_info_oob(n00b_alloc_info_t info)
  * @param info Allocation info to query.
  * @return     Optional inline header pointer.
  */
-static inline n00b_option_t(n00b_inline_hdr_t *)
+[[n00b::nogc]] static inline n00b_option_t(n00b_inline_hdr_t *)
 n00b_alloc_info_inline(n00b_alloc_info_t info)
 {
     if (info.kind != n00b_alloc_inline) {
@@ -167,25 +167,25 @@ n00b_alloc_info_inline(n00b_alloc_info_t info)
     return n00b_option_set(n00b_inline_hdr_t *, info.hdr.in_line);
 }
 
-static inline bool
+[[n00b::nogc]] static inline bool
 n00b_alloc_info_is_oob(n00b_alloc_info_t info)
 {
     return info.kind == n00b_alloc_oob;
 }
 
-static inline bool
+[[n00b::nogc]] static inline bool
 n00b_alloc_info_is_inline(n00b_alloc_info_t info)
 {
     return info.kind == n00b_alloc_inline;
 }
 
-static inline bool
+[[n00b::nogc]] static inline bool
 n00b_alloc_info_is_heap(n00b_alloc_info_t info)
 {
     return info.kind == n00b_alloc_oob || info.kind == n00b_alloc_inline;
 }
 
-static inline bool
+[[n00b::nogc]] static inline bool
 n00b_alloc_info_is_static_range(n00b_alloc_info_t info)
 {
     return info.kind == n00b_alloc_static_range;
@@ -199,13 +199,13 @@ n00b_alloc_info_is_static_range(n00b_alloc_info_t info)
  * conservative scanning should treat this as "may be a live object I cannot
  * see", not as "free space". n00b#327.
  */
-static inline bool
+[[n00b::nogc]] static inline bool
 n00b_alloc_info_is_interior_unresolvable(n00b_alloc_info_t info)
 {
     return info.kind == n00b_alloc_interior_unresolvable;
 }
 
-static inline n00b_option_t(n00b_alloc_range_t *)
+[[n00b::nogc]] static inline n00b_option_t(n00b_alloc_range_t *)
 n00b_alloc_info_static_range(n00b_alloc_info_t info)
 {
     if (info.kind != n00b_alloc_static_range) {
@@ -214,7 +214,7 @@ n00b_alloc_info_static_range(n00b_alloc_info_t info)
     return n00b_option_set(n00b_alloc_range_t *, info.hdr.range);
 }
 
-static inline bool
+[[n00b::nogc]] static inline bool
 n00b_alloc_info_exists(n00b_alloc_info_t info)
 {
     return info.kind != n00b_alloc_none;

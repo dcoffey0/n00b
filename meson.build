@@ -4494,6 +4494,10 @@ test('lint_interior_resolution', python3,
     args: [files('scripts/lint_interior_resolution.py'), meson.project_source_root()],
     suite: 'lint',
 )
+test('lint_interior_resolution_self_test', python3,
+    args: [files('scripts/lint_interior_resolution.py'), '--self-test'],
+    suite: 'lint',
+)
 
 # Calls that SA_RESTART does not restart have to handle EINTR.
 test('lint_eintr', python3,

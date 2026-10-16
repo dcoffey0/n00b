@@ -7,7 +7,11 @@
  * a time for each pointer, an object of S bytes holding pointers into itself
  * costs O(S^2) per collection, and so does an array of slices into one large
  * buffer. The heaps are a GC arena, which the collection moves or pins, and
- * user_pool, which it traces through.
+ * user_pool, which it traces through. A third shape is stale words into a
+ * live segment's unallocated tail, whose scans stop at the per-mapping bound
+ * without finding a guard; those must not each repeat the bound's walk. Only
+ * the copying collector leaves a segment bounded below its size, so that shape
+ * tests something only under N00B_GC_PIN_ALL=0.
  *
  * The check is counted work, not time: n00b_sentinel_scan_words over one
  * collection. Each heap is built at two object sizes, and the words walked
@@ -38,9 +42,12 @@
 #define SLOT_STRIDE   8
 #define ADDR_MASK     ((uintptr_t)0x5a5a5a5a5a5a5a5aULL)
 
-// Words a linear mark may walk per heap word. The memoized walk stays under 3;
-// the unbounded walk is above 1000 at the sizes below.
-#define WALK_PER_HEAP_WORD 16
+// Words a linear mark may walk per heap word, memo lines included. The
+// memoized walk stays under 3; the unbounded walk is above 1000 at the sizes
+// below. A stale word may walk its whole 256-byte memo line, 32 words, before
+// reaching an answered one.
+#define WALK_PER_HEAP_WORD  16
+#define WALK_PER_STALE_WORD 64
 
 static int failures = 0;
 
@@ -61,6 +68,8 @@ pass(const char *what)
 static void ***g_self;
 static void  **g_slices;
 static char   *g_blob;
+static void  **g_stale;
+static char   *g_keep;
 
 #define ALLOC_OPTS(a) &(n00b_alloc_opts_t){.allocator = (a)}
 
@@ -207,8 +216,44 @@ run_slices(heap_kind_t kind, uint64_t bytes)
     return c;
 }
 
+// `n` words pointing 1 MB into the unallocated tail of a live segment whose
+// largest object is 64 KB: the stale stack words and dead pointers a
+// conservative scan meets. A copying collection leaves the live set in a fresh
+// segment whose registry record bounds the backward scan by the largest object
+// copied into it, so each of these scans stops at that bound without finding a
+// guard.
+static cost_t
+run_stale(uint64_t n)
+{
+    n00b_arena_t *arena = n00b_new_arena(.size = 64 * 1024 * 1024, .use_gc = true);
+
+    g_keep = n00b_alloc_array_with_opts(char,
+                                        64 * 1024,
+                                        &(n00b_alloc_opts_t){
+                                            .allocator = (n00b_allocator_t *)arena,
+                                            .no_scan   = true,
+                                        });
+    (void)walked_by_collect(arena);
+
+    char *tail = n00b_atomic_load(&arena->next_alloc) + 1024 * 1024;
+
+    n00b_require(tail + n * sizeof(void *) < arena->segment_end,
+                 "the stale words must land inside the live segment");
+
+    g_stale = n00b_alloc_array(void *, n);
+    for (uint64_t j = 0; j < n; j++) {
+        g_stale[j] = tail + j * sizeof(void *);
+    }
+
+    cost_t c = {.heap_words = n, .walked = walked_by_collect(arena)};
+
+    g_stale = nullptr;
+    g_keep  = nullptr;
+    return c;
+}
+
 static void
-check(const char *shape, cost_t small, cost_t big)
+check(const char *shape, cost_t small, cost_t big, int bound)
 {
     uint64_t added_words  = big.heap_words - small.heap_words;
     uint64_t added_walked = big.walked > small.walked ? big.walked - small.walked : 0;
@@ -225,14 +270,14 @@ check(const char *shape, cost_t small, cost_t big)
 
     char msg[256];
 
-    if (per_word > WALK_PER_HEAP_WORD) {
+    if (per_word > bound) {
         snprintf(msg,
                  sizeof msg,
                  "%s: the guard scan walked %.1f words per added heap word,"
                  " over the linear bound of %d",
                  shape,
                  per_word,
-                 WALK_PER_HEAP_WORD);
+                 bound);
         fail(msg);
         return;
     }
@@ -241,7 +286,7 @@ check(const char *shape, cost_t small, cost_t big)
              "%s: interior-pointer resolution stays within %d words walked"
              " per heap word",
              shape,
-             WALK_PER_HEAP_WORD);
+             bound);
     pass(msg);
 }
 
@@ -263,14 +308,22 @@ main(int argc, char **argv)
         cost_t self_small = run_self(kind, 4096);
         cost_t self_big   = run_self(kind, 16384);
         snprintf(shape, sizeof shape, "%s, self-referencing arrays", kind.name);
-        check(shape, self_small, self_big);
+        check(shape, self_small, self_big, WALK_PER_HEAP_WORD);
 
         // 4K slices into a 64 KB blob, then into a 256 KB one.
         cost_t sl_small = run_slices(kind, 64 * 1024);
         cost_t sl_big   = run_slices(kind, 256 * 1024);
         snprintf(shape, sizeof shape, "%s, slices into one blob", kind.name);
-        check(shape, sl_small, sl_big);
+        check(shape, sl_small, sl_big, WALK_PER_HEAP_WORD);
     }
+
+    // 1K, then 4K stale words into one arena's free tail.
+    cost_t stale_small = run_stale(1024);
+    cost_t stale_big   = run_stale(4096);
+    check("gc arena, stale words into free space",
+          stale_small,
+          stale_big,
+          WALK_PER_STALE_WORD);
 
     n00b_shutdown();
     return failures ? 1 : 0;
