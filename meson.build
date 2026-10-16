@@ -4495,6 +4495,19 @@ test('lint_interior_resolution', python3,
     suite: 'lint',
 )
 
+# Calls that SA_RESTART does not restart have to handle EINTR.
+test('lint_eintr', python3,
+    args: [files('scripts/lint_eintr.py'), meson.project_source_root()],
+    suite: 'lint',
+)
+
+# Calls a signal interrupts must resume.
+eintr_signals_test = executable('test_eintr_signals',
+    ['test/unit/test_eintr_signals.c'],
+    kwargs: test_common_kwargs,
+)
+test('eintr_signals', eintr_signals_test, suite: 'unit', timeout: 120)
+
 std_streams_test = executable('test_std_streams',
     ['test/unit/test_std_streams.c'],
     kwargs: test_common_kwargs,

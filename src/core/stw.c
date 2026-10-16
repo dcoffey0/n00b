@@ -223,6 +223,7 @@ _n00b_thread_stw_suspend_handler(int sig, siginfo_t *si, void *uctx)
     // stays valid for the whole scan window.
     while (n00b_atomic_load(&self->gc_preempt_suspended)) {
         struct timespec tout = {.tv_sec = 0, .tv_nsec = 1000 * 1000};
+        // eintr: an early wake only rechecks the flag.
         (void)_n00b_raw_linux_syscall4(SYS_clock_nanosleep,
                                         CLOCK_MONOTONIC,
                                         0,

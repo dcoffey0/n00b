@@ -1062,6 +1062,8 @@ x11_poll_event(void *vctx, int32_t timeout_ms, n00b_event_t *out)
         tvp = &tv;
     }
 
+    // eintr: an interrupted wait reports no event, as a timeout does, and the
+    // caller polls again.
     int rc = select(fd + 1, &readfds, NULL, NULL, tvp);
     if (rc <= 0) {
         return false;

@@ -397,6 +397,7 @@ epoll_io_wait(void *vctx, n00b_conduit_io_event_t *events, int max_events,
     int ep_max = max_events < 64 ? max_events : 64;
 
     long raw_n;
+    // eintr: EINTR returns no events, and the event loop waits again.
     n00b_run_blocking(
         raw_n = _n00b_raw_linux_syscall6(SYS_epoll_pwait,
                                          (long)ctx->epfd,

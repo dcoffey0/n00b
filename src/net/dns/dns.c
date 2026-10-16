@@ -1,5 +1,6 @@
 #include "net/dns.h"
 #include "core/alloc.h"
+#include "core/eintr.h"
 #include "core/random.h"
 #include "core/runtime.h"
 
@@ -343,10 +344,26 @@ n00b_dns_nameserver_parse_line(n00b_dns_nameservers_t *servers,
     (void)n00b_dns_nameserver_add(servers, ip);
 }
 
+#ifdef N00B_DEBUG
+[[n00b::nomap]] struct sockaddr_storage n00b_dns_test_nameserver = {};
+socklen_t n00b_dns_test_nameserver_len = 0;
+#endif
+
 static void
 n00b_dns_nameservers_load(n00b_dns_nameservers_t *servers)
 {
     *servers = (n00b_dns_nameservers_t){};
+
+#ifdef N00B_DEBUG
+    if (n00b_dns_test_nameserver_len != 0) {
+        memcpy(&servers->addr[0],
+               &n00b_dns_test_nameserver,
+               n00b_dns_test_nameserver_len);
+        servers->len[0] = n00b_dns_test_nameserver_len;
+        servers->count  = 1;
+        return;
+    }
+#endif
 
     int fd = open("/etc/resolv.conf", O_RDONLY);
     if (fd >= 0) {
@@ -701,8 +718,10 @@ n00b_dns_query_one(const struct sockaddr *server,
             continue;
         }
 
+        // A signal ends the poll early but not the attempt, which keeps
+        // waiting for whatever is left of its timeout.
         struct pollfd pfd = {.fd = fd, .events = POLLIN};
-        int           pr  = poll(&pfd, 1, timeouts_ms[attempt]);
+        int           pr  = n00b_poll_eintr(&pfd, 1, timeouts_ms[attempt]);
         if (pr > 0 && (pfd.revents & POLLIN) != 0) {
             struct sockaddr_storage src     = {};
             socklen_t               src_len = sizeof(src);

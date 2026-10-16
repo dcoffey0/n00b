@@ -193,6 +193,7 @@ wsa_create_wakeup_pair(SOCKET *rd_out, SOCKET *wr_out)
         return false;
     }
 
+    // eintr: Winsock calls never fail with EINTR.
     if (connect(writer, (struct sockaddr *)&addr, sizeof(addr)) == SOCKET_ERROR) {
         closesocket(writer);
         closesocket(listener);

@@ -8,6 +8,7 @@
  */
 
 #include "vfs/frontend_nfs.h"
+#include "core/eintr.h"
 #include "internal/vfs/nfs_xdr.h"
 #include "internal/vfs/nfs_rpc.h"
 #include "core/alloc.h"
@@ -316,6 +317,13 @@ write_rpc_reply_hdr(n00b_xdr_t *x, uint32_t xid)
     n00b_xdr_put_u32(x, N00B_RPC_SUCCESS);
 }
 
+// The client socket's send and receive timeout. On Linux a signal interrupts
+// a blocking call on the socket even under SA_RESTART, where macOS restarts
+// it, so each call retries until the timeout would have passed.
+#define NFS_IO_TIMEOUT_SEC 5
+#define NFS_IO_DEADLINE()                                                     \
+    (n00b_ns_timestamp() + (uint64_t)NFS_IO_TIMEOUT_SEC * N00B_NS_PER_SEC)
+
 static bool
 send_record(int fd, uint8_t *data, uint32_t len)
 {
@@ -327,11 +335,14 @@ send_record(int fd, uint8_t *data, uint32_t len)
     };
 
     // Send header + payload.
-    if (write(fd, hdr, 4) != 4) return false;
+    if (n00b_retry_eintr_until(NFS_IO_DEADLINE(), write(fd, hdr, 4)) != 4) {
+        return false;
+    }
 
     size_t sent = 0;
     while (sent < len) {
-        ssize_t w = write(fd, data + sent, len - sent);
+        ssize_t w = n00b_retry_eintr_until(NFS_IO_DEADLINE(),
+                                           write(fd, data + sent, len - sent));
         if (w <= 0) return false;
         sent += (size_t)w;
     }
@@ -1272,7 +1283,8 @@ recv_exact(int fd, uint8_t *buf, uint32_t len)
 {
     uint32_t got = 0;
     while (got < len) {
-        ssize_t r = read(fd, buf + got, len - got);
+        ssize_t r = n00b_retry_eintr_until(NFS_IO_DEADLINE(),
+                                           read(fd, buf + got, len - got));
         if (r <= 0) return false;
         got += (uint32_t)r;
     }
@@ -1289,7 +1301,7 @@ handle_client(nfs_ctx_t *nc, int client_fd)
     if (fl >= 0) {
         (void)fcntl(client_fd, F_SETFL, fl & ~O_NONBLOCK);
     }
-    struct timeval tv = {.tv_sec = 5, .tv_usec = 0};
+    struct timeval tv = {.tv_sec = NFS_IO_TIMEOUT_SEC, .tv_usec = 0};
     setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 

@@ -652,6 +652,8 @@ poll_wait_with_timers(void *vctx, n00b_conduit_io_event_t *events,
         if (adjusted_timeout > 0) {
             struct timespec ts = {.tv_sec  = adjusted_timeout / 1000,
                                   .tv_nsec = (adjusted_timeout % 1000) * 1000000};
+            // eintr: woken early, this runs only the timers that are due, and
+            // the event loop waits again.
             nanosleep(&ts, nullptr);
         }
         poll_process_timers(ctx, 0);
@@ -662,6 +664,7 @@ poll_wait_with_timers(void *vctx, n00b_conduit_io_event_t *events,
 #ifdef __linux__
     long raw_n;
 #if defined(SYS_poll)
+    // eintr: EINTR is handled below as a wait with no events.
     n00b_run_blocking(
         raw_n = _n00b_raw_linux_syscall3(SYS_poll,
                                          (long)(uintptr_t)ctx->fds,
@@ -677,6 +680,7 @@ poll_wait_with_timers(void *vctx, n00b_conduit_io_event_t *events,
         };
         poll_timeout_ptr = &poll_timeout;
     }
+    // eintr: as above.
     n00b_run_blocking(
         raw_n = _n00b_raw_linux_syscall5(SYS_ppoll,
                                          (long)(uintptr_t)ctx->fds,
@@ -687,6 +691,7 @@ poll_wait_with_timers(void *vctx, n00b_conduit_io_event_t *events,
 #endif
     n = (int)raw_n;
 #else
+    // eintr: as above.
     n00b_run_blocking(n = poll(ctx->fds, ctx->count, adjusted_timeout));
 #endif
     if (n < 0) {

@@ -825,6 +825,7 @@ n00b_conduit_conn_tcp(n00b_conduit_t *c, n00b_conduit_io_backend_t *io,
     }
     n00b_conduit_conn_t *conn = n00b_result_get(conn_r);
 
+    // eintr: the socket is nonblocking, so connect does not sleep.
     int ret = connect(fd, (struct sockaddr *)&addr, sizeof(addr));
     int saved_errno = N00B_SOCK_ERRNO;
     return connect_finalize(conn, ret, saved_errno);
@@ -963,6 +964,8 @@ n00b_conduit_conn_unix(n00b_conduit_t *c, n00b_conduit_io_backend_t *io,
                                 unix_socket_errno(N00B_SOCK_ERRNO));
     }
 
+    // eintr: Linux restarts an AF_UNIX connect under SA_RESTART, and macOS
+    // completes or refuses one without sleeping.
     int ret = connect(fd, (struct sockaddr *)&addr, addr_len);
     if (ret < 0) {
         int saved_errno = unix_socket_errno(N00B_SOCK_ERRNO);

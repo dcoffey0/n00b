@@ -304,6 +304,7 @@ kqueue_wait(void *vctx, n00b_conduit_io_event_t *events, int max_events,
     int kmax = max_events < 64 ? max_events : 64;
 
     int n;
+    // eintr: EINTR returns no events, and the event loop waits again.
     n00b_run_blocking(n = kevent(ctx->kq, nullptr, 0, kevents, kmax, timeout_ptr));
     if (n < 0) {
         if (errno == EINTR) {

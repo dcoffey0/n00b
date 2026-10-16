@@ -564,10 +564,44 @@ static const char *content_type_cstr(n00b_string_t *ct);
  * helpers so the HTTP/1.1 wire format stays in one place.
  * =========================================================================== */
 
+#ifndef _WIN32
+static int plain_tcp_wait(N00B_HTTP_PLAIN_SOCK_T fd,
+                          short                  events,
+                          uint64_t               deadline_ns);
+
+// A connect that a signal interrupts carries on in the kernel, and POSIX
+// does not allow calling connect() again on the socket to wait for it. Wait
+// for the socket to turn writable instead, then read the attempt's outcome.
+// Returns 0 once connected, -1 with errno set when the attempt failed, or
+// N00B_QUIC_ERR_TIMEOUT when the deadline passes first.
+static int
+plain_tcp_connect_finish(N00B_HTTP_PLAIN_SOCK_T fd, uint64_t deadline_ns)
+{
+    int rc = plain_tcp_wait(fd, POLLOUT, deadline_ns);
+    if (rc == N00B_QUIC_ERR_TIMEOUT) {
+        return rc;
+    }
+    if (rc != 0) {
+        return -1;
+    }
+    int       err = 0;
+    socklen_t len = sizeof(err);
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) != 0) {
+        return -1;
+    }
+    if (err != 0) {
+        errno = err;
+        return -1;
+    }
+    return 0;
+}
+#endif
+
 static int
 plain_tcp_connect(const char *host,
                   uint16_t    port,
                   int32_t     timeout_ms,
+                  uint64_t    deadline_ns,
                   N00B_HTTP_PLAIN_SOCK_T *out_fd)
 {
     *out_fd = N00B_HTTP_PLAIN_BAD_SOCK;
@@ -608,6 +642,7 @@ plain_tcp_connect(const char *host,
         if (fd == N00B_HTTP_PLAIN_BAD_SOCK) {
             continue;
         }
+        // eintr: Winsock calls never fail with EINTR.
         if (connect(fd, ai->ai_addr, (socklen_t)ai->ai_addrlen) == 0) {
             break;
         }
@@ -632,26 +667,16 @@ plain_tcp_connect(const char *host,
         if (fd == N00B_HTTP_PLAIN_BAD_SOCK) {
             continue;
         }
-        // EINTR on a blocking connect leaves the attempt in progress rather
-        // than failed, and POSIX does not allow re-calling connect() on the
-        // same socket to wait for it. Close and retry this address from a
-        // fresh socket; the bounded retry keeps a pathological signal rate
-        // from looping forever, and falling through to the next address is
-        // the same thing that happens for any other connect failure.
+        // eintr: macOS never restarts a blocking TCP connect, and
+        // plain_tcp_connect_finish waits for an interrupted one to finish.
         int rc = connect(fd, (struct sockaddr *)&addrs[i].ss, addrs[i].len);
-#ifndef _WIN32
-        for (int tries = 0; rc != 0 && errno == EINTR && tries < 4; tries++) {
-            N00B_HTTP_PLAIN_CLOSE(fd);
-            fd = socket(addrs[i].ss.ss_family, SOCK_STREAM, 0);
-            if (fd == N00B_HTTP_PLAIN_BAD_SOCK) {
-                break;
+        if (rc != 0 && errno == EINTR) {
+            rc = plain_tcp_connect_finish(fd, deadline_ns);
+            if (rc == N00B_QUIC_ERR_TIMEOUT) {
+                N00B_HTTP_PLAIN_CLOSE(fd);
+                return rc;
             }
-            rc = connect(fd, (struct sockaddr *)&addrs[i].ss, addrs[i].len);
         }
-        if (fd == N00B_HTTP_PLAIN_BAD_SOCK) {
-            continue;
-        }
-#endif
         if (rc == 0) {
             break;
         }
@@ -710,6 +735,7 @@ plain_tcp_wait(N00B_HTTP_PLAIN_SOCK_T fd, short events, uint64_t deadline_ns)
                             / N00B_NS_PER_MS);
         }
         struct pollfd pfd = {.fd = fd, .events = events};
+        // eintr: this loop retries EINTR for what is left of the deadline.
         int           rc  = poll(&pfd, 1, wait_ms);
         if (rc > 0) {
             return 0;
@@ -734,12 +760,14 @@ plain_tcp_send_all(N00B_HTTP_PLAIN_SOCK_T fd,
     while (off < len) {
 #ifdef _WIN32
         int chunk = (len - off) > INT_MAX ? INT_MAX : (int)(len - off);
+        // eintr: Winsock calls never fail with EINTR.
         int rc = send(fd, bytes + off, chunk, 0);
 #else
         int ready = plain_tcp_wait(fd, POLLOUT, deadline_ns);
         if (ready != 0) {
             return ready;
         }
+        // eintr: MSG_DONTWAIT never sleeps, and the loop retries EINTR.
         ssize_t rc = send(fd, bytes + off, len - off, MSG_DONTWAIT);
 #endif
 #ifndef _WIN32
@@ -790,12 +818,14 @@ plain_tcp_recv_all(N00B_HTTP_PLAIN_SOCK_T  fd,
 
     while (true) {
 #ifdef _WIN32
+        // eintr: Winsock calls never fail with EINTR.
         int rc = recv(fd, chunk, (int)sizeof(chunk), 0);
 #else
         int ready = plain_tcp_wait(fd, POLLIN, deadline_ns);
         if (ready != 0) {
             return ready;
         }
+        // eintr: MSG_DONTWAIT never sleeps, and the loop retries EINTR.
         ssize_t rc = recv(fd, chunk, sizeof(chunk), MSG_DONTWAIT);
 #endif
         if (rc == 0) {
@@ -906,6 +936,7 @@ plain_http_request_sync(n00b_string_t           *url,
     int rc = plain_tcp_connect(u->host->data,
                                 u->port,
                                 timeout_ms,
+                                deadline_ns,
                                 &fd);
     if (rc != 0) {
         return n00b_result_err(n00b_http_response_t *, rc);

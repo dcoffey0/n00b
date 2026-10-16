@@ -2162,6 +2162,8 @@ nc_poll_event(void *vctx, int32_t timeout_ms, n00b_event_t *out)
     // Use poll() + non-blocking get, matching slop's ctui pattern.
     int nc_fd = notcurses_inputready_fd(ctx->nc);
     struct pollfd pfd = { .fd = nc_fd, .events = POLLIN };
+    // eintr: an interrupted wait reports no event, as a timeout does, and the
+    // caller polls again.
     int pr = poll(&pfd, 1, timeout_ms);
     if (pr <= 0) {
         return false;

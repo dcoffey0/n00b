@@ -32,3 +32,10 @@ extern int n00b_dns_resolve_addrs(n00b_string_t        *host,
                                   uint16_t              port,
                                   n00b_resolved_addr_t *out,
                                   int                   cap);
+
+#ifdef N00B_DEBUG
+/* Test hook, only under N00B_DEBUG. A nonzero n00b_dns_test_nameserver_len
+ * makes n00b_dns_test_nameserver the only server queried. */
+extern struct sockaddr_storage n00b_dns_test_nameserver;
+extern socklen_t               n00b_dns_test_nameserver_len;
+#endif
