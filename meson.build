@@ -4345,6 +4345,12 @@ fd_managed_test = executable('test_fd_managed',
 )
 test('fd_managed', fd_managed_test, suite: 'unit')
 
+fd_read_claim_handoff_test = executable('test_fd_read_claim_handoff',
+    ['test/unit/test_fd_read_claim_handoff.c'],
+    kwargs: test_common_kwargs,
+)
+test('fd_read_claim_handoff', fd_read_claim_handoff_test, suite: 'unit')
+
 if target_os == 'windows'
     io_windows_test = executable('test_io_windows',
         ['test/unit/test_io_windows.c'],

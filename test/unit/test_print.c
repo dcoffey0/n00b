@@ -904,24 +904,40 @@ test_print_timed_out_write_is_written_once(void)
 
     test_stdout_redirect_t redir = test_redirect_stdout(fds[1]);
 
+    int64_t t0 = n00b_ns_timestamp();
     n00b_conduit_fd_owner_hold_writes(true);
     n00b_printf("queued-«#»", 1);
     n00b_conduit_fd_owner_hold_writes(false);
+    int64_t t1 = n00b_ns_timestamp();
 
     bool flushed = n00b_conduit_fd_owner_flush(rt->stdout_owner, 30000);
 
     n00b_printf("after-«#»", 2);
+    int64_t t2 = n00b_ns_timestamp();
 
     test_restore_stdout(&redir);
     test_fd_close(fds[1]);
 
     char buf[256];
-    read_pipe(fds[0], buf, 255);
+    int  got = read_pipe(fds[0], buf, 255);
     test_fd_close(fds[0]);
 
     if (!flushed || strcmp(buf, "queued-1\nafter-2\n") != 0) {
-        printf("  [FAIL] timed-out write: flushed %d, got \"%s\"\n",
-               flushed, buf);
+        // stderr, not stdout: under meson stdout is a block-buffered pipe, and
+        // the abort below would take this line with it.
+        fprintf(stderr, "  [FAIL] timed-out write: flushed %d, %d bytes \"",
+                flushed, got);
+        for (int i = 0; i < got; i++) {
+            if (buf[i] == '\n') {
+                fputs("\\n", stderr);
+            }
+            else {
+                fputc(buf[i], stderr);
+            }
+        }
+        fprintf(stderr, "\" (queued print %lld ms, flush and after print %lld ms)\n",
+                (long long)((t1 - t0) / N00B_NS_PER_MS),
+                (long long)((t2 - t1) / N00B_NS_PER_MS));
         assert(false);
     }
 

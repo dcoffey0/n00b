@@ -259,6 +259,8 @@ fd_owner_close_raw(n00b_conduit_fd_owner_t *owner)
 
 static void fd_owner_update_io_mask(n00b_conduit_fd_owner_t *owner);
 static void fd_owner_do_reads(n00b_conduit_fd_owner_t *owner);
+static void fd_owner_read_pass(n00b_conduit_fd_owner_t  *owner,
+                               n00b_conduit_topic_base_t *topic);
 static void wq_drain_with_error(n00b_conduit_fd_owner_t *owner, int error_code);
 static void publish_status(n00b_conduit_fd_owner_t *owner,
                            n00b_conduit_fd_status_op_t status,
@@ -337,6 +339,7 @@ n00b_conduit_fd_manage(n00b_conduit_t *c, n00b_conduit_io_backend_t *io,
     n00b_atomic_store(&owner->read_active, false);
     n00b_atomic_store(&owner->write_active, false);
     n00b_atomic_store(&owner->write_draining, false);
+    n00b_atomic_store(&owner->read_again, false);
     n00b_atomic_store(&owner->registry_registered, false);
     n00b_atomic_store(&owner->native_released, false);
     n00b_atomic_store(&owner->close_generation, 0);
@@ -711,29 +714,65 @@ transition_state(n00b_conduit_fd_owner_t *owner, bool read_closed, bool write_cl
     }
 }
 
+#ifdef N00B_DEBUG
+void (*n00b_fd_owner_read_pass_end_hook)(n00b_conduit_fd_owner_t *owner) = nullptr;
+#endif
+
+// A read pass holds the read topic's publisher claim, and a pass that cannot
+// claim it leaves the reading to the pass that has it. That is only safe if
+// the holder still reads what the loser came for. kqueue arms data fds with
+// EV_CLEAR, so readiness is reported once per arrival: if the bytes land after
+// the holder's last read() and the loser's event is the one that reports
+// them, nothing reports them again and they stay in the socket for good.
+//
+// So the loser asks for another pass (read_again) BEFORE it tries the claim,
+// and the holder checks for one AFTER it lets the claim go. Either the
+// loser's try_claim came after the yield and it reads for itself, or it came
+// before, in which case its request is visible to the holder's check.
 static void
 fd_owner_do_reads(n00b_conduit_fd_owner_t *owner)
 {
-    if (!n00b_atomic_load(&owner->read_active)) {
-        return;
+    n00b_atomic_store(&owner->read_again, true);
+
+    while (n00b_atomic_load(&owner->read_again)) {
+        if (!n00b_atomic_load(&owner->read_active)) {
+            return;
+        }
+
+        int state = n00b_atomic_load(&owner->state);
+        if (state == N00B_CONDUIT_FD_READ_CLOSED || state == N00B_CONDUIT_FD_CLOSED) {
+            return;
+        }
+
+        n00b_conduit_topic_base_t *topic = owner->read_topic;
+
+        n00b_result_t(n00b_conduit_publisher_t *) pub_res =
+            n00b_conduit_publish_try_claim(topic);
+        if (n00b_result_is_err(pub_res)) {
+            // The holder will see read_again and read for us. The epoch
+            // still records that this pass did not run.
+            n00b_atomic_add(&topic->epoch, 1);
+            return;
+        }
+        n00b_conduit_publisher_t *pub = n00b_result_get(pub_res);
+        n00b_atomic_store(&owner->read_again, false);
+
+        fd_owner_read_pass(owner, topic);
+
+#ifdef N00B_DEBUG
+        if (n00b_fd_owner_read_pass_end_hook != nullptr) {
+            n00b_fd_owner_read_pass_end_hook(owner);
+        }
+#endif
+        n00b_conduit_publish_yield(pub);
     }
+}
 
-    int state = n00b_atomic_load(&owner->state);
-    if (state == N00B_CONDUIT_FD_READ_CLOSED || state == N00B_CONDUIT_FD_CLOSED) {
-        return;
-    }
-
-    n00b_conduit_topic_base_t *topic = owner->read_topic;
-
-    n00b_result_t(n00b_conduit_publisher_t *) pub_res =
-        n00b_conduit_publish_try_claim(topic);
-    if (n00b_result_is_err(pub_res)) {
-        // Bump epoch so subscribers know a read event was dropped.
-        n00b_atomic_add(&topic->epoch, 1);
-        return;
-    }
-    n00b_conduit_publisher_t *pub = n00b_result_get(pub_res);
-
+// One pass: read until the fd would block, reaches EOF, or fails. The caller
+// holds the read topic's claim.
+static void
+fd_owner_read_pass(n00b_conduit_fd_owner_t *owner, n00b_conduit_topic_base_t *topic)
+{
     uint8_t buf[READ_BUF_SIZE];
 
     while (1) {
@@ -803,8 +842,6 @@ fd_owner_do_reads(n00b_conduit_fd_owner_t *owner)
         transition_state(owner, true, false);
         break;
     }
-
-    n00b_conduit_publish_yield(pub);
 }
 
 // ============================================================================

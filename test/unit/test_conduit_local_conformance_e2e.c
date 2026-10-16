@@ -217,6 +217,10 @@ assert_bytes_eq(n00b_buffer_t *buf, const char *expected, int64_t len)
  */
 static const char *g_case  = "(none)";
 static int         g_iter  = -1;
+// The bridge pool of the case under way, if it has one. A stalled read there
+// is either a bridge job that never got a worker (queued > 0 with every worker
+// busy) or one that ran and lost the bytes, and the pool's counts say which.
+static n00b_worker_pool_t *g_pool = nullptr;
 
 #define LOCAL_CONF_CASE(name)   (g_case = (name), g_iter = -1)
 #define LOCAL_CONF_ITER(i)      (g_iter = (int)(i))
@@ -239,6 +243,14 @@ local_conf_context(const char *what, int line)
                 what, g_case, line);
     }
     fflush(stderr);
+    // After the line above is out: these take the pool's lock, and if that
+    // is what is stuck the report must not go down with it.
+    if (g_pool != nullptr) {
+        fprintf(stderr, "         bridge pool: %d queued, %d running\n",
+                n00b_worker_pool_pending(g_pool),
+                n00b_worker_pool_in_flight(g_pool));
+        fflush(stderr);
+    }
 }
 
 static void
@@ -274,10 +286,15 @@ assert_read_buffer_at(n00b_conduit_local_conn_t *conn,
         n00b_conduit_local_conn_read_topic_typed(conn);
     assert(read_topic != nullptr);
 
-    auto rr = n00b_conduit_read(n00b_buffer_t *, read_topic,
-                                .timeout_ms = N00B_TEST_IO_BUDGET_MS);
+    int64_t started = n00b_ns_timestamp();
+    auto    rr      = n00b_conduit_read(n00b_buffer_t *, read_topic,
+                                        .timeout_ms = N00B_TEST_IO_BUDGET_MS);
     if (!n00b_result_is_ok(rr)) {
         local_conf_context("read", line);
+        fprintf(stderr, "         read returned error %d after %lld ms\n",
+                (int)n00b_result_get_err(rr),
+                (long long)((n00b_ns_timestamp() - started) / N00B_NS_PER_MS));
+        fflush(stderr);
     }
     assert(n00b_result_is_ok(rr));
 
@@ -720,6 +737,7 @@ run_bridge_pool_churn_case(void)
     auto pool_r = n00b_conduit_local_bridge_pool_new(2, 2);
     assert(n00b_result_is_ok(pool_r));
     n00b_worker_pool_t *pool = n00b_result_get(pool_r);
+    g_pool                   = pool;
 
     auto lr = n00b_conduit_local_listen(c, name,
                                         .backend      = N00B_CONDUIT_LOCAL_UNIX,
@@ -789,6 +807,7 @@ run_bridge_pool_churn_case(void)
     // or still queued -- exits at the top of its loop. Shutdown drains and joins
     // while the conduit is still alive (jobs read conn->conduit), THEN tear the
     // conduit down: no bridge job can be in-flight against a destroyed conduit.
+    g_pool = nullptr;
     n00b_worker_pool_shutdown(pool);
     teardown_conduit(c);
 }
