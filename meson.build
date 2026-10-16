@@ -4337,6 +4337,12 @@ fd_managed_test = executable('test_fd_managed',
 )
 test('fd_managed', fd_managed_test, suite: 'unit')
 
+fd_read_claim_handoff_test = executable('test_fd_read_claim_handoff',
+    ['test/unit/test_fd_read_claim_handoff.c'],
+    kwargs: test_common_kwargs,
+)
+test('fd_read_claim_handoff', fd_read_claim_handoff_test, suite: 'unit')
+
 if target_os == 'windows'
     io_windows_test = executable('test_io_windows',
         ['test/unit/test_io_windows.c'],
@@ -4486,12 +4492,6 @@ fd_owner_read_all_test = executable('test_fd_owner_read_all',
     kwargs: test_common_kwargs,
 )
 test('fd_owner_read_all', fd_owner_read_all_test, suite: 'unit')
-
-fd_read_claim_handoff_test = executable('test_fd_read_claim_handoff',
-    ['test/unit/test_fd_read_claim_handoff.c'],
-    kwargs: test_common_kwargs,
-)
-test('fd_read_claim_handoff', fd_read_claim_handoff_test, suite: 'unit')
 
 # ============================================================================
 # Regex engine tests — registered via subdir during Phase 11 of the regex port.
