@@ -18,6 +18,7 @@
 #include "core/mutex.h"
 #include "core/platform.h"
 #include "core/pool.h"
+#include "core/random.h"
 #include "core/thread.h"
 #include "core/time.h"
 #include "internal/rocs/index.h"
@@ -128,7 +129,7 @@ N00B_CONDUIT_TOPIC_IMPL(n00b_store_ingest_payload_t);
 
 
 #define ROCS_STORE_CATALOG_MAGIC_LEN 8
-#define ROCS_STORE_CATALOG_VERSION   6
+#define ROCS_STORE_CATALOG_VERSION   7
 #define ROCS_STORE_CATALOG_VERSION_MIN 1
 // Parse bound on one entry's summarized TERM fields; no schema declares this
 // many.
@@ -473,6 +474,21 @@ struct n00b_store_t {
     n00b_allocator_t              *hot_allocator;
     n00b_string_t                 *hot_partition_key;
     rocs_store_catalog_list_t     *catalog;
+    // The catalog on disk is an image plus a log of the changes since it
+    // (rocs_store_catalog_log_append). The image names the log that follows
+    // it by epoch, and a fold writes the next epoch's image.
+    uint64_t                       catalog_log_epoch;
+    // Drawn for each image and written in its log's header, so a log is
+    // replayed only after the image it was written for.
+    uint64_t                       catalog_log_id;
+    uint64_t                       catalog_log_records;
+    uint64_t                       catalog_log_bytes;
+    uint64_t                       catalog_image_bytes;
+    bool                           catalog_log_present;
+    // Whether a commit may append rather than fold. It holds only once an
+    // image this build appends after has been loaded or written, and a torn
+    // tail, a failed append, or a failed fold clears it.
+    bool                           catalog_log_usable;
     // Sorted, immutable index over `catalog`, republished by every catalog
     // mutation. See rocs_store_catalog_view_t.
     rocs_store_catalog_view_t     *catalog_view;
@@ -3021,6 +3037,26 @@ rocs_store_catalog_path(n00b_store_t *store)
     return path_r;
 }
 
+// The log that follows the image of the given epoch: catalog.<epoch>.log.
+static n00b_result_t(n00b_string_t *)
+rocs_store_catalog_log_path(n00b_store_t *store, uint64_t epoch)
+{
+    if (store == nullptr || store->root == nullptr
+        || epoch > (uint64_t)INT64_MAX) {
+        return n00b_result_err(n00b_string_t *, N00B_STORE_ERR_ARG);
+    }
+
+    n00b_string_t *epoch_s =
+        n00b_unicode_str_from_int((int64_t)epoch, .allocator = store->allocator);
+    n00b_string_t *file = n00b_unicode_str_cat(
+        n00b_unicode_str_cat(r"catalog.", epoch_s, .allocator = store->allocator),
+        r".log",
+        .allocator = store->allocator);
+    return rocs_store_path_join(store->root,
+                                file,
+                                .allocator = store->allocator);
+}
+
 static n00b_result_t(n00b_string_t *)
 rocs_store_shard_dir_path(n00b_store_t *store)
 {
@@ -3676,8 +3712,29 @@ rocs_store_catalog_read_point(n00b_store_t             *store,
                                      rocs_store_catalog_read_hook_ctx);
     }
 }
+
+static n00b_store_catalog_write_hook_t rocs_store_catalog_write_hook = nullptr;
+static void *rocs_store_catalog_write_hook_ctx                    = nullptr;
+
+void
+n00b_store_catalog_write_hook_set(n00b_store_catalog_write_hook_t hook,
+                                  void                           *ctx)
+{
+    rocs_store_catalog_write_hook_ctx = ctx;
+    rocs_store_catalog_write_hook     = hook;
+}
+
+#define ROCS_STORE_CATALOG_WRITE_POINT(_store, _site)                       \
+    do {                                                                    \
+        if (rocs_store_catalog_write_hook != nullptr) {                     \
+            rocs_store_catalog_write_hook((_store),                         \
+                                          (_site),                          \
+                                          rocs_store_catalog_write_hook_ctx); \
+        }                                                                   \
+    } while (0)
 #else
 #define ROCS_STORE_CATALOG_VISIT(_n) ((void)0)
+#define ROCS_STORE_CATALOG_WRITE_POINT(_store, _site) ((void)0)
 #endif
 
 static bool rocs_store_entry_pos_less(n00b_store_catalog_entry_t *a,
@@ -4614,6 +4671,8 @@ rocs_store_catalog_serialize(n00b_store_t *store) _kargs
 {
     n00b_store_catalog_entry_t *pending_entry       = nullptr;
     uint64_t                    next_open_shard_id  = 0;
+    uint64_t                    log_epoch           = 0;
+    uint64_t                    log_id              = 0;
 }
 {
     auto buf_r = rocs_store_catalog_buffer_new(.allocator = store->allocator);
@@ -4663,12 +4722,15 @@ rocs_store_catalog_serialize(n00b_store_t *store) _kargs
     auto oldest_gen_r = rocs_store_catalog_append_u64(buf, oldest.generation);
     auto oldest_shard_r = rocs_store_catalog_append_u64(buf, oldest.shard_id);
     auto oldest_ordinal_r = rocs_store_catalog_append_u64(buf, oldest.ordinal);
+    auto epoch_r = rocs_store_catalog_append_u64(buf, log_epoch);
+    auto log_id_r = rocs_store_catalog_append_u64(buf, log_id);
     auto count_r = rocs_store_catalog_append_u64(buf, entry_count);
     if (n00b_result_is_err(version_r) || n00b_result_is_err(generation_r)
         || n00b_result_is_err(next_r) || n00b_result_is_err(schema_r)
         || n00b_result_is_err(oldest_gen_r)
         || n00b_result_is_err(oldest_shard_r)
         || n00b_result_is_err(oldest_ordinal_r)
+        || n00b_result_is_err(epoch_r) || n00b_result_is_err(log_id_r)
         || n00b_result_is_err(count_r)) {
         return n00b_result_err(n00b_buffer_t *, N00B_STORE_ERR_INTERNAL);
     }
@@ -4849,6 +4911,452 @@ rocs_store_catalog_read_term_summary(n00b_store_t                *store,
     return n00b_result_ok(rocs_store_term_summary_list_t *, out);
 }
 
+// One entry as the image and the log both encode it.
+static n00b_result_t(n00b_store_catalog_entry_t *)
+rocs_store_catalog_read_entry(n00b_store_t                *store,
+                              rocs_store_catalog_reader_t *reader,
+                              uint64_t                     version)
+{
+    uint64_t entry_state = ROCS_STORE_CATALOG_ENTRY_SEALED;
+    if (version >= 3) {
+        auto state_r = rocs_store_catalog_read_u64(reader);
+        if (n00b_result_is_err(state_r)) {
+            return n00b_result_err(n00b_store_catalog_entry_t *,
+                                   N00B_STORE_ERR_CORRUPT);
+        }
+        entry_state = n00b_result_get(state_r);
+        if (!rocs_store_catalog_entry_state_persistent(entry_state)) {
+            return n00b_result_err(n00b_store_catalog_entry_t *,
+                                   N00B_STORE_ERR_CORRUPT);
+        }
+    }
+    auto shard_id_r  = rocs_store_catalog_read_u64(reader);
+    auto entry_gen_r = rocs_store_catalog_read_u64(reader);
+    auto bytes_r     = rocs_store_catalog_read_u64(reader);
+    auto records_r   = rocs_store_catalog_read_u64(reader);
+    auto schema_gen_r = rocs_store_catalog_read_u64(reader);
+    auto seal_ts_r   = rocs_store_catalog_read_u64(reader);
+    if (n00b_result_is_err(shard_id_r) || n00b_result_is_err(entry_gen_r)
+        || n00b_result_is_err(bytes_r) || n00b_result_is_err(records_r)
+        || n00b_result_is_err(schema_gen_r)
+        || n00b_result_is_err(seal_ts_r)) {
+        return n00b_result_err(n00b_store_catalog_entry_t *,
+                               N00B_STORE_ERR_CORRUPT);
+    }
+
+    auto path_r = rocs_store_catalog_read_string(
+        reader,
+        .allow_empty = false,
+        .allocator   = store->allocator);
+    auto partition_r = rocs_store_catalog_read_string(
+        reader,
+        .allow_empty = false,
+        .allocator   = store->allocator);
+    auto etag_r = rocs_store_catalog_read_string(
+        reader,
+        .allocator = store->allocator);
+    if (n00b_result_is_err(path_r) || n00b_result_is_err(partition_r)
+        || n00b_result_is_err(etag_r)) {
+        return n00b_result_err(n00b_store_catalog_entry_t *,
+                               N00B_STORE_ERR_CORRUPT);
+    }
+
+    // Duplicate ids are rejected once every entry is read, below.
+    uint64_t shard_id = n00b_result_get(shard_id_r);
+    if (shard_id == 0) {
+        return n00b_result_err(n00b_store_catalog_entry_t *,
+                               N00B_STORE_ERR_CORRUPT);
+    }
+
+    n00b_store_catalog_entry_t *entry = rocs_store_catalog_entry_new(
+        store,
+        .shard_id          = shard_id,
+        .generation        = n00b_result_get(entry_gen_r),
+        .object_path       = n00b_result_get(path_r),
+        .byte_len          = n00b_result_get(bytes_r),
+        .record_count      = n00b_result_get(records_r),
+        .schema_generation = n00b_result_get(schema_gen_r),
+        .seal_ts           = n00b_result_get(seal_ts_r),
+        .partition_key     = n00b_result_get(partition_r),
+        .etag              = n00b_result_get(etag_r));
+    if (version >= 4) {
+        auto summary_r = rocs_store_catalog_read_term_summary(store,
+                                                              reader,
+                                                              version);
+        if (n00b_result_is_err(summary_r)) {
+            return n00b_result_err(n00b_store_catalog_entry_t *,
+                                   n00b_result_get_err(summary_r));
+        }
+        entry->term_summary = n00b_result_get(summary_r);
+    }
+    entry->state = (rocs_store_catalog_entry_state_t)entry_state;
+
+    // n00b#468 already spent version 5 on the Bloom-filter TERM summary,
+    // so the zone block is version 6. Gating it on >= 5 would make a
+    // catalog written by a 5-era build (no zone block) read its next
+    // field as a zone count.
+    if (version >= 6) {
+        auto zone_count_r = rocs_store_catalog_read_u64(reader);
+        if (n00b_result_is_err(zone_count_r)) {
+            return n00b_result_err(n00b_store_catalog_entry_t *,
+                                   N00B_STORE_ERR_CORRUPT);
+        }
+        uint64_t zone_count = n00b_result_get(zone_count_r);
+        if (zone_count != 0) {
+            entry->zones = rocs_store_zone_map_new(store->allocator);
+        }
+        for (uint64_t z = 0; z < zone_count; z++) {
+            auto zfield_r = rocs_store_catalog_read_string(
+                reader,
+                .allow_empty = false,
+                .allocator   = store->allocator);
+            if (n00b_result_is_err(zfield_r)) {
+                return n00b_result_err(n00b_store_catalog_entry_t *,
+                                       N00B_STORE_ERR_CORRUPT);
+            }
+
+            rocs_store_zone_value_t zmin = {};
+            rocs_store_zone_value_t zmax = {};
+            rocs_store_zone_read_t  min_read
+                = rocs_store_zone_read_value(reader, &zmin, store);
+            rocs_store_zone_read_t max_read
+                = rocs_store_zone_read_value(reader, &zmax, store);
+            if (min_read == ROCS_STORE_ZONE_READ_ERR
+                || max_read == ROCS_STORE_ZONE_READ_ERR) {
+                return n00b_result_err(n00b_store_catalog_entry_t *,
+                                       N00B_STORE_ERR_CORRUPT);
+            }
+
+            rocs_store_zone_field_t *zone = rocs_store_zone_field_for(
+                entry->zones,
+                n00b_result_get(zfield_r),
+                store->allocator);
+            zone->min = zmin;
+            zone->max = zmax;
+            // A catalog that somehow recorded bounds it cannot order is
+            // treated as having none, rather than as corruption: the
+            // entry is metadata about cost, and refusing to open a store
+            // over it would turn a lost optimization into an outage.
+            int32_t zcmp = 0;
+            zone->usable = min_read == ROCS_STORE_ZONE_READ_OK
+                        && max_read == ROCS_STORE_ZONE_READ_OK
+                        && rocs_store_zone_cmp(&zmin, &zmax, &zcmp)
+                        && zcmp <= 0;
+        }
+    }
+
+    return n00b_result_ok(n00b_store_catalog_entry_t *, entry);
+}
+
+// ============================================================================
+// Catalog log.
+//
+// A seal, a drop, a reinstate, and a quarantine each append to the log
+// instead of rewriting the image, so their cost does not grow with the
+// catalog. The log opens with ROCS_STORE_CATALOG_LOG_MAGIC and the epoch and
+// log id of the image it follows. A log whose header names another image is
+// never replayed, because the id is drawn fresh for every image.
+//
+// Each append is one frame: an 8-byte length, that many payload bytes, and an
+// FNV-1a checksum of the payload. A payload is the catalog version, the open
+// shard id at the time, and a record count, then per record a kind and an
+// entry (ENTRY) or a shard id (DROP). A frame applies whole or not at all.
+//
+// A frame that fails its checksum is a torn append only when the file ends
+// with it. A failed append makes the next commit fold, so nothing is ever
+// written after a torn frame, and a bad frame with bytes after it is
+// corruption.
+// ============================================================================
+
+#define ROCS_STORE_CATALOG_LOG_MAGIC_LEN      8
+#define ROCS_STORE_CATALOG_LOG_HEADER_LEN     (ROCS_STORE_CATALOG_LOG_MAGIC_LEN + 16)
+#define ROCS_STORE_CATALOG_LOG_FRAME_OVERHEAD 16
+
+static const uint8_t rocs_store_catalog_log_magic[ROCS_STORE_CATALOG_LOG_MAGIC_LEN] = {
+    'R', 'O', 'C', 'S', 'C', 'L', 'G', '1',
+};
+
+typedef enum : uint8_t {
+    ROCS_STORE_CATALOG_LOG_ENTRY = 1,
+    ROCS_STORE_CATALOG_LOG_DROP  = 2,
+} rocs_store_catalog_log_kind_t;
+
+static uint64_t
+rocs_store_catalog_log_checksum(const uint8_t *bytes, uint64_t len)
+{
+    uint64_t hash = UINT64_C(0xcbf29ce484222325);
+    for (uint64_t i = 0; i < len; i++) {
+        hash ^= bytes[i];
+        hash *= UINT64_C(0x100000001b3);
+    }
+    return hash;
+}
+
+static uint64_t
+rocs_store_catalog_log_u64_at(const uint8_t *bytes)
+{
+    uint64_t value = 0;
+    for (uint8_t i = 0; i < 8; i++) {
+        value |= ((uint64_t)bytes[i]) << (i * 8);
+    }
+    return value;
+}
+
+// A shard id and where it came from: a list index or a record's place in
+// the log.
+typedef struct {
+    uint64_t shard_id;
+    uint64_t at;
+} rocs_store_catalog_log_key_t;
+
+static int
+rocs_store_catalog_log_key_cmp(const void *a, const void *b)
+{
+    const rocs_store_catalog_log_key_t *x = a;
+    const rocs_store_catalog_log_key_t *y = b;
+    if (x->shard_id != y->shard_id) {
+        return x->shard_id < y->shard_id ? -1 : 1;
+    }
+    return x->at < y->at ? -1 : x->at > y->at;
+}
+
+// Apply replayed records to the list the image built. A shard ends in its
+// last record: an ENTRY replaces the image's entry or joins the list in
+// position order, and a DROP (a null entry) removes it. Both sides are sorted
+// by id, so n entries and r records cost O((n + r) log(n + r)).
+static void
+rocs_store_catalog_log_apply(n00b_store_t               *store,
+                             n00b_store_shard_id_list_t *ids,
+                             rocs_store_catalog_list_t  *entries)
+{
+    size_t r = n00b_list_len(*ids);
+    size_t n = n00b_list_len(*store->catalog);
+    if (r == 0) {
+        return;
+    }
+
+    rocs_store_catalog_log_key_t *recs = n00b_alloc_array_with_opts(
+        rocs_store_catalog_log_key_t,
+        r,
+        &(n00b_alloc_opts_t){.allocator = store->allocator,
+                             .scan_kind = N00B_GC_SCAN_KIND_NONE});
+    rocs_store_catalog_log_key_t *have = n00b_alloc_array_with_opts(
+        rocs_store_catalog_log_key_t,
+        n == 0 ? 1 : n,
+        &(n00b_alloc_opts_t){.allocator = store->allocator,
+                             .scan_kind = N00B_GC_SCAN_KIND_NONE});
+    n00b_store_catalog_entry_t **kept = n00b_alloc_array_with_opts(
+        n00b_store_catalog_entry_t *,
+        n == 0 ? 1 : n,
+        &(n00b_alloc_opts_t){.allocator = store->allocator,
+                             .scan_kind = N00B_GC_SCAN_KIND_ALL});
+    n00b_store_catalog_entry_t **added = n00b_alloc_array_with_opts(
+        n00b_store_catalog_entry_t *,
+        r,
+        &(n00b_alloc_opts_t){.allocator = store->allocator,
+                             .scan_kind = N00B_GC_SCAN_KIND_ALL});
+
+    for (size_t i = 0; i < r; i++) {
+        recs[i] = (rocs_store_catalog_log_key_t){
+            .shard_id = n00b_list_get(*ids, i),
+            .at       = i,
+        };
+    }
+    for (size_t i = 0; i < n; i++) {
+        ROCS_STORE_CATALOG_VISIT(1);
+        kept[i] = n00b_list_get(*store->catalog, i);
+        have[i] = (rocs_store_catalog_log_key_t){
+            .shard_id = kept[i]->shard_id,
+            .at       = i,
+        };
+    }
+    qsort(recs, r, sizeof(*recs), rocs_store_catalog_log_key_cmp);
+    qsort(have, n, sizeof(*have), rocs_store_catalog_log_key_cmp);
+
+    size_t nadded = 0;
+    size_t h      = 0;
+    for (size_t i = 0; i < r; i++) {
+        if (i + 1 < r && recs[i + 1].shard_id == recs[i].shard_id) {
+            continue;
+        }
+        ROCS_STORE_CATALOG_VISIT(1);
+        uint64_t                    id   = recs[i].shard_id;
+        n00b_store_catalog_entry_t *last = n00b_list_get(*entries, recs[i].at);
+        while (h < n && have[h].shard_id < id) {
+            h++;
+        }
+        if (h < n && have[h].shard_id == id) {
+            kept[have[h].at] = last;
+        }
+        else if (last != nullptr) {
+            added[nadded++] = last;
+        }
+    }
+    qsort(added,
+          nadded,
+          sizeof(*added),
+          rocs_store_catalog_view_pos_cmp);
+
+    rocs_store_catalog_list_t *out =
+        rocs_store_catalog_list_new(.allocator = store->allocator);
+    size_t a = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (kept[i] == nullptr) {
+            continue;
+        }
+        while (a < nadded && rocs_store_entry_pos_less(added[a], kept[i])) {
+            n00b_list_push(*out, added[a++]);
+        }
+        n00b_list_push(*out, kept[i]);
+    }
+    while (a < nadded) {
+        n00b_list_push(*out, added[a++]);
+    }
+    store->catalog = out;
+}
+
+// Replay the log that follows the image onto the list it built. Returns
+// false, changing nothing, when the file is not this image's log: shorter
+// than a header, which is a first append that never completed, or a header
+// naming another image.
+static n00b_result_t(bool)
+rocs_store_catalog_log_replay(n00b_store_t  *store,
+                              n00b_buffer_t *log,
+                              uint64_t      *next_open_shard_id,
+                              uint64_t      *max_shard_id,
+                              bool          *torn)
+{
+    int64_t        log_len = 0;
+    const uint8_t *bytes   = (const uint8_t *)n00b_buffer_to_c(log, &log_len);
+    uint64_t       len     = (uint64_t)log_len;
+
+    *torn = false;
+    if (len < ROCS_STORE_CATALOG_LOG_HEADER_LEN) {
+        return n00b_result_ok(bool, false);
+    }
+    if (memcmp(bytes,
+               rocs_store_catalog_log_magic,
+               ROCS_STORE_CATALOG_LOG_MAGIC_LEN)
+        != 0) {
+        return n00b_result_err(bool, N00B_STORE_ERR_CORRUPT);
+    }
+    if (rocs_store_catalog_log_u64_at(bytes + ROCS_STORE_CATALOG_LOG_MAGIC_LEN)
+            != store->catalog_log_epoch
+        || rocs_store_catalog_log_u64_at(bytes + ROCS_STORE_CATALOG_LOG_MAGIC_LEN
+                                         + 8)
+               != store->catalog_log_id) {
+        return n00b_result_ok(bool, false);
+    }
+
+    n00b_store_shard_id_list_t *ids =
+        rocs_store_shard_id_list_new(.allocator = store->allocator);
+    rocs_store_catalog_list_t *entries =
+        rocs_store_catalog_list_new(.allocator = store->allocator);
+    uint64_t pos = ROCS_STORE_CATALOG_LOG_HEADER_LEN;
+    while (pos < len) {
+        uint64_t left = len - pos;
+        uint64_t plen = left < ROCS_STORE_CATALOG_LOG_FRAME_OVERHEAD
+                          ? UINT64_MAX
+                          : rocs_store_catalog_log_u64_at(bytes + pos);
+        if (plen > left - ROCS_STORE_CATALOG_LOG_FRAME_OVERHEAD
+            || left < ROCS_STORE_CATALOG_LOG_FRAME_OVERHEAD) {
+            *torn = true;
+            break;
+        }
+        uint64_t start = pos + 8;
+        uint64_t end   = start + plen + 8;
+        if (rocs_store_catalog_log_u64_at(bytes + start + plen)
+            != rocs_store_catalog_log_checksum(bytes + start, plen)) {
+            if (end != len) {
+                return n00b_result_err(bool, N00B_STORE_ERR_CORRUPT);
+            }
+            *torn = true;
+            break;
+        }
+
+        rocs_store_catalog_reader_t reader = {
+            .buf = log,
+            .pos = start,
+            .len = start + plen,
+        };
+        auto version_r = rocs_store_catalog_read_u64(&reader);
+        auto open_r    = rocs_store_catalog_read_u64(&reader);
+        auto count_r   = rocs_store_catalog_read_u64(&reader);
+        if (n00b_result_is_err(version_r) || n00b_result_is_err(open_r)
+            || n00b_result_is_err(count_r)) {
+            return n00b_result_err(bool, N00B_STORE_ERR_CORRUPT);
+        }
+        uint64_t version = n00b_result_get(version_r);
+        if (version < 7 || version > ROCS_STORE_CATALOG_VERSION) {
+            return n00b_result_err(bool, N00B_STORE_ERR_CORRUPT);
+        }
+
+        uint64_t count = n00b_result_get(count_r);
+        for (uint64_t k = 0; k < count; k++) {
+            auto kind_r = rocs_store_catalog_read_u8(&reader);
+            if (n00b_result_is_err(kind_r)) {
+                return n00b_result_err(bool, N00B_STORE_ERR_CORRUPT);
+            }
+            if (n00b_result_get(kind_r) == ROCS_STORE_CATALOG_LOG_ENTRY) {
+                auto entry_r = rocs_store_catalog_read_entry(store,
+                                                             &reader,
+                                                             version);
+                if (n00b_result_is_err(entry_r)) {
+                    return n00b_result_err(bool, n00b_result_get_err(entry_r));
+                }
+                n00b_store_catalog_entry_t *entry = n00b_result_get(entry_r);
+                if (entry->shard_id > *max_shard_id) {
+                    *max_shard_id = entry->shard_id;
+                }
+                n00b_list_push(*ids, entry->shard_id);
+                n00b_list_push(*entries, entry);
+            }
+            else if (n00b_result_get(kind_r) == ROCS_STORE_CATALOG_LOG_DROP) {
+                auto id_r = rocs_store_catalog_read_u64(&reader);
+                if (n00b_result_is_err(id_r) || n00b_result_get(id_r) == 0) {
+                    return n00b_result_err(bool, N00B_STORE_ERR_CORRUPT);
+                }
+                n00b_list_push(*ids, n00b_result_get(id_r));
+                n00b_list_push(*entries, (n00b_store_catalog_entry_t *)nullptr);
+            }
+            else {
+                return n00b_result_err(bool, N00B_STORE_ERR_CORRUPT);
+            }
+        }
+        if (reader.pos != reader.len) {
+            return n00b_result_err(bool, N00B_STORE_ERR_CORRUPT);
+        }
+        if (n00b_result_get(open_r) > *next_open_shard_id) {
+            *next_open_shard_id = n00b_result_get(open_r);
+        }
+        pos = end;
+    }
+
+    rocs_store_catalog_log_apply(store, ids, entries);
+    store->catalog_log_present = true;
+    store->catalog_log_records = n00b_list_len(*ids);
+    store->catalog_log_bytes   = pos;
+    return n00b_result_ok(bool, true);
+}
+
+// The log file the image names, or nullptr when there is none.
+static n00b_result_t(n00b_buffer_t *)
+rocs_store_catalog_log_read(n00b_store_t *store)
+{
+    auto path_r = rocs_store_catalog_log_path(store, store->catalog_log_epoch);
+    if (n00b_result_is_err(path_r)) {
+        return n00b_result_err(n00b_buffer_t *, n00b_result_get_err(path_r));
+    }
+    auto stat_r = n00b_vfs_stat(store->vfs, n00b_result_get(path_r));
+    if (n00b_result_is_err(stat_r)) {
+        if (n00b_result_get_err(stat_r) == N00B_VFS_ERR_NOT_FOUND) {
+            return n00b_result_ok(n00b_buffer_t *, nullptr);
+        }
+        return n00b_result_err(n00b_buffer_t *, N00B_STORE_ERR_VFS);
+    }
+    return rocs_store_read_vfs_object(store, n00b_result_get(path_r));
+}
+
 static n00b_result_t(bool)
 rocs_store_catalog_parse(n00b_store_t *store, n00b_buffer_t *buf)
 {
@@ -4910,6 +5418,18 @@ rocs_store_catalog_parse(n00b_store_t *store, n00b_buffer_t *buf)
         }
     }
 
+    store->catalog_log_epoch = 0;
+    store->catalog_log_id    = 0;
+    if (version >= 7) {
+        auto epoch_r  = rocs_store_catalog_read_u64(&reader);
+        auto log_id_r = rocs_store_catalog_read_u64(&reader);
+        if (n00b_result_is_err(epoch_r) || n00b_result_is_err(log_id_r)) {
+            return n00b_result_err(bool, N00B_STORE_ERR_CORRUPT);
+        }
+        store->catalog_log_epoch = n00b_result_get(epoch_r);
+        store->catalog_log_id    = n00b_result_get(log_id_r);
+    }
+
     auto count_r = rocs_store_catalog_read_u64(&reader);
     if (n00b_result_is_err(count_r)) {
         return n00b_result_err(bool, N00B_STORE_ERR_CORRUPT);
@@ -4920,128 +5440,14 @@ rocs_store_catalog_parse(n00b_store_t *store, n00b_buffer_t *buf)
     uint64_t max_shard_id       = 0;
 
     for (uint64_t i = 0; i < entry_count; i++) {
-        uint64_t entry_state = ROCS_STORE_CATALOG_ENTRY_SEALED;
-        if (version >= 3) {
-            auto state_r = rocs_store_catalog_read_u64(&reader);
-            if (n00b_result_is_err(state_r)) {
-                return n00b_result_err(bool, N00B_STORE_ERR_CORRUPT);
-            }
-            entry_state = n00b_result_get(state_r);
-            if (!rocs_store_catalog_entry_state_persistent(entry_state)) {
-                return n00b_result_err(bool, N00B_STORE_ERR_CORRUPT);
-            }
+        auto entry_r = rocs_store_catalog_read_entry(store, &reader, version);
+        if (n00b_result_is_err(entry_r)) {
+            return n00b_result_err(bool, n00b_result_get_err(entry_r));
         }
-        auto shard_id_r  = rocs_store_catalog_read_u64(&reader);
-        auto entry_gen_r = rocs_store_catalog_read_u64(&reader);
-        auto bytes_r     = rocs_store_catalog_read_u64(&reader);
-        auto records_r   = rocs_store_catalog_read_u64(&reader);
-        auto schema_gen_r = rocs_store_catalog_read_u64(&reader);
-        auto seal_ts_r   = rocs_store_catalog_read_u64(&reader);
-        if (n00b_result_is_err(shard_id_r) || n00b_result_is_err(entry_gen_r)
-            || n00b_result_is_err(bytes_r) || n00b_result_is_err(records_r)
-            || n00b_result_is_err(schema_gen_r)
-            || n00b_result_is_err(seal_ts_r)) {
-            return n00b_result_err(bool, N00B_STORE_ERR_CORRUPT);
+        n00b_store_catalog_entry_t *entry = n00b_result_get(entry_r);
+        if (entry->shard_id > max_shard_id) {
+            max_shard_id = entry->shard_id;
         }
-
-        auto path_r = rocs_store_catalog_read_string(
-            &reader,
-            .allow_empty = false,
-            .allocator   = store->allocator);
-        auto partition_r = rocs_store_catalog_read_string(
-            &reader,
-            .allow_empty = false,
-            .allocator   = store->allocator);
-        auto etag_r = rocs_store_catalog_read_string(
-            &reader,
-            .allocator = store->allocator);
-        if (n00b_result_is_err(path_r) || n00b_result_is_err(partition_r)
-            || n00b_result_is_err(etag_r)) {
-            return n00b_result_err(bool, N00B_STORE_ERR_CORRUPT);
-        }
-
-        // Duplicate ids are rejected once every entry is read, below.
-        uint64_t shard_id = n00b_result_get(shard_id_r);
-        if (shard_id == 0) {
-            return n00b_result_err(bool, N00B_STORE_ERR_CORRUPT);
-        }
-        if (shard_id > max_shard_id) {
-            max_shard_id = shard_id;
-        }
-
-        n00b_store_catalog_entry_t *entry = rocs_store_catalog_entry_new(
-            store,
-            .shard_id          = shard_id,
-            .generation        = n00b_result_get(entry_gen_r),
-            .object_path       = n00b_result_get(path_r),
-            .byte_len          = n00b_result_get(bytes_r),
-            .record_count      = n00b_result_get(records_r),
-            .schema_generation = n00b_result_get(schema_gen_r),
-            .seal_ts           = n00b_result_get(seal_ts_r),
-            .partition_key     = n00b_result_get(partition_r),
-            .etag              = n00b_result_get(etag_r));
-        if (version >= 4) {
-            auto summary_r = rocs_store_catalog_read_term_summary(store,
-                                                                  &reader,
-                                                                  version);
-            if (n00b_result_is_err(summary_r)) {
-                return n00b_result_err(bool, n00b_result_get_err(summary_r));
-            }
-            entry->term_summary = n00b_result_get(summary_r);
-        }
-        entry->state = (rocs_store_catalog_entry_state_t)entry_state;
-
-        // n00b#468 already spent version 5 on the Bloom-filter TERM summary,
-        // so the zone block is version 6. Gating it on >= 5 would make a
-        // catalog written by a 5-era build (no zone block) read its next
-        // field as a zone count.
-        if (version >= 6) {
-            auto zone_count_r = rocs_store_catalog_read_u64(&reader);
-            if (n00b_result_is_err(zone_count_r)) {
-                return n00b_result_err(bool, N00B_STORE_ERR_CORRUPT);
-            }
-            uint64_t zone_count = n00b_result_get(zone_count_r);
-            if (zone_count != 0) {
-                entry->zones = rocs_store_zone_map_new(store->allocator);
-            }
-            for (uint64_t z = 0; z < zone_count; z++) {
-                auto zfield_r = rocs_store_catalog_read_string(
-                    &reader,
-                    .allow_empty = false,
-                    .allocator   = store->allocator);
-                if (n00b_result_is_err(zfield_r)) {
-                    return n00b_result_err(bool, N00B_STORE_ERR_CORRUPT);
-                }
-
-                rocs_store_zone_value_t zmin = {};
-                rocs_store_zone_value_t zmax = {};
-                rocs_store_zone_read_t  min_read
-                    = rocs_store_zone_read_value(&reader, &zmin, store);
-                rocs_store_zone_read_t max_read
-                    = rocs_store_zone_read_value(&reader, &zmax, store);
-                if (min_read == ROCS_STORE_ZONE_READ_ERR
-                    || max_read == ROCS_STORE_ZONE_READ_ERR) {
-                    return n00b_result_err(bool, N00B_STORE_ERR_CORRUPT);
-                }
-
-                rocs_store_zone_field_t *zone = rocs_store_zone_field_for(
-                    entry->zones,
-                    n00b_result_get(zfield_r),
-                    store->allocator);
-                zone->min = zmin;
-                zone->max = zmax;
-                // A catalog that somehow recorded bounds it cannot order is
-                // treated as having none, rather than as corruption: the
-                // entry is metadata about cost, and refusing to open a store
-                // over it would turn a lost optimization into an outage.
-                int32_t zcmp = 0;
-                zone->usable = min_read == ROCS_STORE_ZONE_READ_OK
-                            && max_read == ROCS_STORE_ZONE_READ_OK
-                            && rocs_store_zone_cmp(&zmin, &zmax, &zcmp)
-                            && zcmp <= 0;
-            }
-        }
-
         n00b_list_push(*store->catalog, entry);
     }
 
@@ -5049,6 +5455,26 @@ rocs_store_catalog_parse(n00b_store_t *store, n00b_buffer_t *buf)
     // did not deserialize, and id 0 is never valid (it is the sentinel).
     if (reader.pos != reader.len || next_open_shard_id == 0) {
         return n00b_result_err(bool, N00B_STORE_ERR_CORRUPT);
+    }
+    // An image from before version 7 names no log, so the first commit
+    // folds it into one that does, as it does after a torn tail.
+    store->catalog_image_bytes = reader.len;
+    bool torn                  = false;
+    if (version >= 7) {
+        auto log_r = rocs_store_catalog_log_read(store);
+        if (n00b_result_is_err(log_r)) {
+            return n00b_result_err(bool, n00b_result_get_err(log_r));
+        }
+        if (n00b_result_get(log_r) != nullptr) {
+            auto replay_r = rocs_store_catalog_log_replay(store,
+                                                          n00b_result_get(log_r),
+                                                          &next_open_shard_id,
+                                                          &max_shard_id,
+                                                          &torn);
+            if (n00b_result_is_err(replay_r)) {
+                return replay_r;
+            }
+        }
     }
     rocs_store_catalog_publish(store);
     rocs_store_catalog_view_t *view = rocs_store_catalog_view_load(store);
@@ -5091,6 +5517,7 @@ rocs_store_catalog_parse(n00b_store_t *store, n00b_buffer_t *buf)
         store->next_shard_id = next_open_shard_id + 1;
     }
     rocs_store_refresh_oldest_available(store);
+    store->catalog_log_usable = version >= 7 && !torn;
     return n00b_result_ok(bool, true);
 }
 
@@ -5121,7 +5548,6 @@ rocs_store_catalog_load(n00b_store_t *store)
     if (n00b_result_is_err(buf_r)) {
         return n00b_result_err(bool, n00b_result_get_err(buf_r));
     }
-
     return rocs_store_catalog_parse(store, n00b_result_get(buf_r));
 }
 
@@ -5176,22 +5602,54 @@ rocs_store_catalog_write_staged(n00b_store_t               *store,
         return n00b_result_err(bool, n00b_result_get_err(path_r));
     }
 
-    auto buf_r = rocs_store_catalog_serialize(
+    uint64_t epoch  = store->catalog_log_epoch + 1;
+    uint64_t log_id = n00b_rand64();
+    auto     buf_r  = rocs_store_catalog_serialize(
         store,
         .pending_entry      = pending_entry,
-        .next_open_shard_id = next_open_shard_id);
+        .next_open_shard_id = next_open_shard_id,
+        .log_epoch          = epoch,
+        .log_id             = log_id);
     if (n00b_result_is_err(buf_r)) {
         return n00b_result_err(bool, n00b_result_get_err(buf_r));
     }
 
     // The encoding is as large as the whole catalog and the VFS copies it,
     // so it is released as soon as the write returns.
-    n00b_buffer_t *buf = n00b_result_get(buf_r);
+    n00b_buffer_t *buf         = n00b_result_get(buf_r);
+    uint64_t       image_bytes = (uint64_t)n00b_buffer_len(buf);
+    ROCS_STORE_CATALOG_WRITE_POINT(store, N00B_STORE_CATALOG_FOLD_BEGIN);
     auto write_r = rocs_store_write_vfs_object(store,
                                                n00b_result_get(path_r),
                                                buf,
                                                .vfs_err_out = vfs_err_out);
     n00b_buffer_free(buf);
+    if (n00b_result_is_err(write_r)) {
+        // The image may have landed even though the write failed, and then
+        // it names an epoch nothing appends to. Only another fold makes
+        // either outcome whole, so the next commit folds.
+        store->catalog_log_usable = false;
+        return write_r;
+    }
+    ROCS_STORE_CATALOG_WRITE_POINT(store, N00B_STORE_CATALOG_FOLD_WRITTEN);
+
+    // The log just absorbed stays one more epoch for readers that loaded
+    // the previous image; the one before it goes. Best-effort, since no
+    // image names it.
+    uint64_t old_epoch = store->catalog_log_epoch;
+    store->catalog_log_epoch   = epoch;
+    store->catalog_log_id      = log_id;
+    store->catalog_image_bytes = image_bytes;
+    store->catalog_log_present = false;
+    store->catalog_log_records = 0;
+    store->catalog_log_bytes   = 0;
+    store->catalog_log_usable  = true;
+    if (old_epoch != 0) {
+        auto old_r = rocs_store_catalog_log_path(store, old_epoch - 1);
+        if (n00b_result_is_ok(old_r)) {
+            (void)n00b_vfs_delete(store->vfs, n00b_result_get(old_r));
+        }
+    }
     return write_r;
 }
 
@@ -5199,6 +5657,203 @@ static n00b_result_t(bool)
 rocs_store_catalog_write(n00b_store_t *store)
 {
     return rocs_store_catalog_write_staged(store, nullptr, 0);
+}
+
+// The open shard id an image written now would record.
+static uint64_t
+rocs_store_catalog_open_shard_id(n00b_store_t *store)
+{
+    return store->hot_shard == nullptr ? store->next_shard_id
+                                       : store->hot_shard->shard_id;
+}
+
+// One frame with a record per entry: ENTRY records carry the entry and DROP
+// records its shard id.
+static n00b_result_t(n00b_buffer_t *)
+rocs_store_catalog_log_frame(n00b_store_t                 *store,
+                             rocs_store_catalog_log_kind_t kind,
+                             uint64_t                      next_open_shard_id,
+                             rocs_store_catalog_list_t    *entries)
+{
+    size_t         n       = n00b_list_len(*entries);
+    n00b_buffer_t *payload = n00b_buffer_empty(.allocator = store->allocator);
+    auto r = rocs_store_catalog_append_u64(payload, ROCS_STORE_CATALOG_VERSION);
+    if (n00b_result_is_ok(r)) {
+        r = rocs_store_catalog_append_u64(payload, next_open_shard_id);
+    }
+    if (n00b_result_is_ok(r)) {
+        r = rocs_store_catalog_append_u64(payload, (uint64_t)n);
+    }
+    for (size_t i = 0; n00b_result_is_ok(r) && i < n; i++) {
+        n00b_store_catalog_entry_t *entry = n00b_list_get(*entries, i);
+        r = rocs_store_catalog_append_u8(payload, (uint8_t)kind);
+        if (n00b_result_is_ok(r)) {
+            r = kind == ROCS_STORE_CATALOG_LOG_ENTRY
+                  ? rocs_store_catalog_append_entry(store, payload, entry)
+                  : rocs_store_catalog_append_u64(payload, entry->shard_id);
+        }
+    }
+    if (n00b_result_is_err(r)) {
+        n00b_buffer_free(payload);
+        return n00b_result_err(n00b_buffer_t *, n00b_result_get_err(r));
+    }
+
+    int64_t        plen  = 0;
+    const uint8_t *bytes = (const uint8_t *)n00b_buffer_to_c(payload, &plen);
+    n00b_buffer_t *frame = n00b_buffer_empty(.allocator = store->allocator);
+    (void)rocs_store_catalog_append_u64(frame, (uint64_t)plen);
+    n00b_buffer_concat(frame, payload);
+    (void)rocs_store_catalog_append_u64(
+        frame,
+        rocs_store_catalog_log_checksum(bytes, (uint64_t)plen));
+    n00b_buffer_free(payload);
+    return n00b_result_ok(n00b_buffer_t *, frame);
+}
+
+// Write one frame to the log and make it durable. The first frame after a
+// fold writes the whole file, header included, replacing anything an
+// earlier store left at the path. A failed write may still have reached the
+// file, so the next commit folds rather than appending after it.
+static n00b_result_t(bool)
+rocs_store_catalog_log_append(n00b_store_t  *store,
+                              n00b_buffer_t *frame,
+                              uint64_t       nrecords,
+                              n00b_err_t    *vfs_err_out)
+{
+    if (vfs_err_out != nullptr) {
+        *vfs_err_out = N00B_VFS_ERR_NONE;
+    }
+    auto path_r = rocs_store_catalog_log_path(store, store->catalog_log_epoch);
+    if (n00b_result_is_err(path_r)) {
+        return n00b_result_err(bool, n00b_result_get_err(path_r));
+    }
+    n00b_string_t *path = n00b_result_get(path_r);
+
+    n00b_result_t(bool) write_r;
+    uint64_t len = (uint64_t)n00b_buffer_len(frame);
+    if (!store->catalog_log_present) {
+        n00b_buffer_t *data = n00b_buffer_empty(.allocator = store->allocator);
+        n00b_buffer_append_bytes(data,
+                                 (void *)rocs_store_catalog_log_magic,
+                                 ROCS_STORE_CATALOG_LOG_MAGIC_LEN);
+        (void)rocs_store_catalog_append_u64(data, store->catalog_log_epoch);
+        (void)rocs_store_catalog_append_u64(data, store->catalog_log_id);
+        n00b_buffer_concat(data, frame);
+        len     = (uint64_t)n00b_buffer_len(data);
+        write_r = rocs_store_write_vfs_object(store,
+                                              path,
+                                              data,
+                                              .vfs_err_out = vfs_err_out);
+        n00b_buffer_free(data);
+    }
+    else {
+        auto append_r = n00b_vfs_append(store->vfs, path, frame);
+        if (n00b_result_is_err(append_r)) {
+            if (vfs_err_out != nullptr) {
+                *vfs_err_out = n00b_result_get_err(append_r);
+            }
+            write_r = n00b_result_err(bool, N00B_STORE_ERR_VFS);
+        }
+        else {
+            write_r = rocs_store_sync_if_supported(store, path, vfs_err_out);
+        }
+    }
+    if (n00b_result_is_err(write_r)) {
+        store->catalog_log_usable = false;
+        return n00b_result_err(bool, n00b_result_get_err(write_r));
+    }
+
+    store->catalog_log_present  = true;
+    store->catalog_log_records += nrecords;
+    store->catalog_log_bytes   += len;
+    ROCS_STORE_CATALOG_WRITE_POINT(store, N00B_STORE_CATALOG_LOG_APPENDED);
+    return n00b_result_ok(bool, true);
+}
+
+static bool
+rocs_store_catalog_log_usable(n00b_store_t *store)
+{
+    return store->catalog_log_usable;
+}
+
+static n00b_result_t(bool)
+rocs_store_catalog_log_commit(n00b_store_t                 *store,
+                              rocs_store_catalog_log_kind_t kind,
+                              uint64_t                      next_open_shard_id,
+                              rocs_store_catalog_list_t    *entries,
+                              n00b_err_t                   *vfs_err_out)
+{
+    auto frame_r = rocs_store_catalog_log_frame(store,
+                                                kind,
+                                                next_open_shard_id,
+                                                entries);
+    if (n00b_result_is_err(frame_r)) {
+        return n00b_result_err(bool, n00b_result_get_err(frame_r));
+    }
+    auto append_r = rocs_store_catalog_log_append(store,
+                                                  n00b_result_get(frame_r),
+                                                  n00b_list_len(*entries),
+                                                  vfs_err_out);
+    n00b_buffer_free(n00b_result_get(frame_r));
+    return append_r;
+}
+
+// Commit a seal's entry, which is not yet in the list.
+static n00b_result_t(bool)
+rocs_store_catalog_commit_entry(n00b_store_t               *store,
+                                n00b_store_catalog_entry_t *entry,
+                                uint64_t                    next_open_shard_id,
+                                n00b_err_t                 *vfs_err_out)
+{
+    if (!rocs_store_catalog_log_usable(store)) {
+        return rocs_store_catalog_write_staged(store,
+                                               entry,
+                                               next_open_shard_id,
+                                               .vfs_err_out = vfs_err_out);
+    }
+    rocs_store_catalog_list_t *one =
+        rocs_store_catalog_list_new(.allocator = store->allocator);
+    n00b_list_push(*one, entry);
+    return rocs_store_catalog_log_commit(store,
+                                         ROCS_STORE_CATALOG_LOG_ENTRY,
+                                         next_open_shard_id,
+                                         one,
+                                         vfs_err_out);
+}
+
+// Commit entries the list already holds again (ENTRY), or no longer holds
+// (DROP, by shard id).
+static n00b_result_t(bool)
+rocs_store_catalog_commit_list(n00b_store_t                 *store,
+                               rocs_store_catalog_log_kind_t kind,
+                               rocs_store_catalog_list_t    *entries)
+{
+    if (n00b_list_len(*entries) == 0) {
+        return n00b_result_ok(bool, true);
+    }
+    if (!rocs_store_catalog_log_usable(store)) {
+        return rocs_store_catalog_write(store);
+    }
+    return rocs_store_catalog_log_commit(store,
+                                         kind,
+                                         rocs_store_catalog_open_shard_id(store),
+                                         entries,
+                                         nullptr);
+}
+
+// Fold once the log holds at least N00B_STORE_CATALOG_FOLD_MIN_RECORDS
+// records and half the image's bytes, so a fold's cost is spread over at
+// least that many appends. Best-effort: the log stays durable when a fold
+// fails, and the next commit folds again.
+static void
+rocs_store_catalog_maybe_fold(n00b_store_t *store)
+{
+    if (store->read_only || !store->catalog_log_usable
+        || store->catalog_log_records < N00B_STORE_CATALOG_FOLD_MIN_RECORDS
+        || store->catalog_log_bytes * 2 < store->catalog_image_bytes) {
+        return;
+    }
+    (void)rocs_store_catalog_write(store);
 }
 
 static bool
@@ -6084,10 +6739,10 @@ rocs_store_seal_job_run(rocs_store_seal_job_t *job)
     entry->term_summary = rocs_store_build_term_summary(store, job->old_shard);
     entry->zones = job->zones;
 
-    auto catalog_r = rocs_store_catalog_write_staged(store,
+    auto catalog_r = rocs_store_catalog_commit_entry(store,
                                                      entry,
                                                      store->next_shard_id,
-                                                     .vfs_err_out = &vfs_err);
+                                                     &vfs_err);
     if (n00b_result_is_err(catalog_r)) {
         (void)n00b_vfs_delete(store->vfs, job->object_path);
         job->old_shard->state   = old_shard_state;
@@ -6114,6 +6769,7 @@ rocs_store_seal_job_run(rocs_store_seal_job_t *job)
     rocs_store_refresh_oldest_available(store);
     rocs_store_rotation_unlock(store);
     rocs_store_catalog_view_retire(store, prev_view);
+    rocs_store_catalog_maybe_fold(store);
     (void)rocs_store_emit_commit(store,
                                  N00B_STORE_COMMIT_SEAL,
                                  entry->shard_id,
@@ -6797,11 +7453,10 @@ rocs_store_seal_hot_shard_unlocked(n00b_store_t  *store,
         rot_entry->term_summary = rocs_store_build_term_summary(store, old_shard);
         rot_entry->zones = rot_zones;
 
-        auto rot_catalog_r = rocs_store_catalog_write_staged(store,
+        auto rot_catalog_r = rocs_store_catalog_commit_entry(store,
                                                              rot_entry,
                                                              store->next_shard_id,
-                                                             .vfs_err_out =
-                                                                 &rot_vfs_err);
+                                                             &rot_vfs_err);
         if (n00b_result_is_err(rot_catalog_r)) {
             (void)n00b_vfs_delete(store->vfs, object_path);
             old_shard->state   = old_shard_state;
@@ -6831,6 +7486,7 @@ rocs_store_seal_hot_shard_unlocked(n00b_store_t  *store,
 
         rocs_store_catalog_push(store, rot_entry);
         rocs_store_refresh_oldest_available(store);
+        rocs_store_catalog_maybe_fold(store);
         (void)rocs_store_emit_commit(store,
                                      N00B_STORE_COMMIT_SEAL,
                                      rot_entry->shard_id,
@@ -7003,7 +7659,10 @@ rocs_store_seal_hot_shard_unlocked(n00b_store_t  *store,
     // keeps its own reference until the swap below, so a failed write leaves
     // them with the hot shard.
     entry->zones = rocs_store_zone_hot_bounds(store);
-    auto catalog_r = rocs_store_catalog_write_staged(store, entry, next_hot_id);
+    auto catalog_r = rocs_store_catalog_commit_entry(store,
+                                                     entry,
+                                                     next_hot_id,
+                                                     nullptr);
     if (n00b_result_is_err(catalog_r)) {
         (void)n00b_vfs_delete(store->vfs, object_path);
         store->hot_shard->state   = old_shard_state;
@@ -7039,6 +7698,7 @@ rocs_store_seal_hot_shard_unlocked(n00b_store_t  *store,
     rocs_store_refresh_oldest_available(store);
     rocs_store_rotation_unlock(store);
     rocs_store_catalog_view_retire(store, prev_view);
+    rocs_store_catalog_maybe_fold(store);
 
     (void)rocs_store_emit_commit(store,
                                  N00B_STORE_COMMIT_SEAL,
@@ -11860,6 +12520,21 @@ n00b_store_open_vfs(n00b_vfs_t          *vfs,
             // fails the corrupt file is simply overwritten by the rebuild.
             (void)n00b_vfs_rename(store->vfs, cpath, aside);
         }
+        auto lpath_r = rocs_store_catalog_log_path(store,
+                                                   store->catalog_log_epoch);
+        if (n00b_result_is_ok(lpath_r)
+            && n00b_result_is_ok(
+                n00b_vfs_stat(store->vfs, n00b_result_get(lpath_r)))) {
+            n00b_string_t *lpath = n00b_result_get(lpath_r);
+            (void)n00b_vfs_rename(
+                store->vfs,
+                lpath,
+                n00b_unicode_str_cat(lpath,
+                                     r".corrupt",
+                                     .allocator = store->allocator));
+        }
+        store->catalog_log_present = false;
+        store->catalog_log_usable  = false;
         // Drop whatever a partial parse may have inserted before it failed.
         store->catalog = rocs_store_catalog_list_new(.allocator = store->allocator);
         rocs_store_catalog_publish(store);
@@ -12140,7 +12815,12 @@ n00b_store_flush(n00b_store_t *store)
         return n00b_result_ok(bool, true);
     }
 
-    auto write_r = rocs_store_catalog_write(store);
+    // Every catalog change is already durable in the image or the log, so
+    // there is nothing to write unless the next commit would have to fold.
+    n00b_result_t(bool) write_r = n00b_result_ok(bool, true);
+    if (!rocs_store_catalog_log_usable(store)) {
+        write_r = rocs_store_catalog_write(store);
+    }
     n00b_mutex_unlock(store->commit_lock);
     if (n00b_result_is_ok(write_r)) {
         rocs_store_try_reclaim_retired_hot_allocators(store);
@@ -13249,7 +13929,12 @@ rocs_store_drop_sealed_shard_locked(n00b_store_t  *store,
         return detach_r;
     }
 
-    auto catalog_r = rocs_store_catalog_write(store);
+    rocs_store_catalog_list_t *changed =
+        rocs_store_catalog_list_new(.allocator = store->allocator);
+    n00b_list_push(*changed, entry);
+    auto catalog_r = rocs_store_catalog_commit_list(store,
+                                                    ROCS_STORE_CATALOG_LOG_DROP,
+                                                    changed);
     if (n00b_result_is_err(catalog_r)) {
         rocs_store_reattach_sealed_shard_locked(store, entry, index);
         rocs_store_catalog_publish(store);
@@ -13265,12 +13950,15 @@ rocs_store_drop_sealed_shard_locked(n00b_store_t  *store,
         rocs_store_catalog_publish(store);
         store->oldest_available     = old_oldest;
         store->has_oldest_available = old_has_oldest;
-        auto rollback_r = rocs_store_catalog_write(store);
-        (void)rollback_r;
+        (void)rocs_store_catalog_commit_list(store,
+                                             ROCS_STORE_CATALOG_LOG_ENTRY,
+                                             changed);
+        rocs_store_catalog_maybe_fold(store);
         return n00b_result_err(bool, N00B_STORE_ERR_VFS);
     }
 
     rocs_store_record_dropped_shard_locked(store, entry, drop_reason);
+    rocs_store_catalog_maybe_fold(store);
     return n00b_result_ok(bool, true);
 }
 
@@ -13432,7 +14120,10 @@ n00b_store_apply_shard_retention(
     }
 
     if (ndetached > 0) {
-        auto catalog_r = rocs_store_catalog_write(store);
+        auto catalog_r = rocs_store_catalog_commit_list(
+            store,
+            ROCS_STORE_CATALOG_LOG_DROP,
+            detached);
         if (n00b_result_is_err(catalog_r)) {
             for (size_t i = ndetached; i-- > 0;) {
                 rocs_store_reattach_sealed_shard_locked(
@@ -13454,14 +14145,15 @@ n00b_store_apply_shard_retention(
         // the file would orphan bytes that nothing will ever reclaim, and
         // reclaiming bytes is the entire point of retention. A reinstated
         // shard is simply retried by the next pass.
-        bool reinstated_any = false;
+        rocs_store_catalog_list_t *reinstated =
+            rocs_store_catalog_list_new(.allocator = store->allocator);
         for (size_t i = 0; i < ndetached; i++) {
             n00b_store_catalog_entry_t *entry = n00b_list_get(*detached, i);
             auto delete_r = n00b_vfs_delete(store->vfs, entry->object_path);
             if (n00b_result_is_err(delete_r)
                 && n00b_result_get_err(delete_r) != N00B_VFS_ERR_NOT_FOUND) {
                 rocs_store_catalog_insert_sorted(store, entry);
-                reinstated_any = true;
+                n00b_list_push(*reinstated, entry);
                 continue;
             }
             rocs_store_record_dropped_shard_locked(store,
@@ -13469,14 +14161,20 @@ n00b_store_apply_shard_retention(
                                                    policy->drop_reason);
             dropped++;
         }
+        if (n00b_list_len(*reinstated) == 0) {
+            rocs_store_catalog_maybe_fold(store);
+        }
 
         // Re-commit a catalog that describes the reinstated shards again.
         // Best-effort, as the single-shard path's rollback write was: the
         // in-memory catalog is already correct, and the next successful
         // write reconciles the image.
-        if (reinstated_any) {
+        if (n00b_list_len(*reinstated) != 0) {
             rocs_store_refresh_oldest_available(store);
-            (void)rocs_store_catalog_write(store);
+            (void)rocs_store_catalog_commit_list(store,
+                                                 ROCS_STORE_CATALOG_LOG_ENTRY,
+                                                 reinstated);
+            rocs_store_catalog_maybe_fold(store);
             n00b_mutex_unlock(store->residency_lock);
             n00b_mutex_unlock(store->commit_lock);
             return n00b_result_err(uint64_t, N00B_STORE_ERR_VFS);
@@ -13574,7 +14272,12 @@ n00b_store_quarantine_shard(n00b_store_t *store,
     rocs_store_catalog_publish(store);
     rocs_store_refresh_oldest_available(store);
 
-    auto catalog_r = rocs_store_catalog_write(store);
+    rocs_store_catalog_list_t *changed =
+        rocs_store_catalog_list_new(.allocator = store->allocator);
+    n00b_list_push(*changed, entry);
+    auto catalog_r = rocs_store_catalog_commit_list(store,
+                                                    ROCS_STORE_CATALOG_LOG_ENTRY,
+                                                    changed);
     if (n00b_result_is_err(catalog_r)) {
         entry->state = ROCS_STORE_CATALOG_ENTRY_SEALED;
         rocs_store_catalog_publish(store);
@@ -13584,6 +14287,7 @@ n00b_store_quarantine_shard(n00b_store_t *store,
         n00b_mutex_unlock(store->commit_lock);
         return n00b_result_err(bool, n00b_result_get_err(catalog_r));
     }
+    rocs_store_catalog_maybe_fold(store);
 
     n00b_mutex_unlock(store->residency_lock);
     n00b_mutex_unlock(store->commit_lock);

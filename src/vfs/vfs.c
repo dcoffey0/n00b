@@ -1294,6 +1294,75 @@ n00b_vfs_sync(n00b_vfs_t *vfs, n00b_string_t *path)
 }
 
 n00b_result_t(bool)
+n00b_vfs_append(n00b_vfs_t *vfs, n00b_string_t *path, n00b_buffer_t *data)
+{
+    if (vfs == nullptr || path == nullptr || data == nullptr) {
+        return n00b_result_err(bool, N00B_VFS_ERR_NULL_ARG);
+    }
+
+    n00b_data_read_lock(vfs->mount_lock);
+    n00b_vfs_mount_t *m = resolve_mount(vfs, path);
+    n00b_data_unlock(vfs->mount_lock);
+
+    if (m == nullptr) {
+        return n00b_result_err(bool, N00B_VFS_ERR_MOUNT);
+    }
+    if (m->flags & N00B_VFS_MOUNT_READONLY) {
+        return n00b_result_err(bool, N00B_VFS_ERR_READ_ONLY);
+    }
+
+    n00b_vfs_hook_ctx_t hctx = {
+        .point  = N00B_VFS_HOOK_PRE_WRITE,
+        .path   = path,
+        .data   = data,
+        .length = n00b_buffer_len(data),
+    };
+
+    n00b_data_read_lock(m->lock);
+    n00b_err_t herr = run_hooks(m, &hctx);
+    n00b_data_unlock(m->lock);
+
+    if (herr != N00B_VFS_ERR_NONE) {
+        return n00b_result_err(bool, herr);
+    }
+    if (hctx.data != nullptr) {
+        data = hctx.data;
+    }
+
+    n00b_string_t                *bpath = strip_prefix(path,
+                                                       m->mount_path,
+                                                       m->allocator);
+    const n00b_vfs_backend_ops_t *ops   = m->backend->ops;
+    n00b_result_t(bool)           put_r;
+    if (ops->append != nullptr) {
+        put_r = ops->append(m->backend->ctx, bpath, data);
+    }
+    else {
+        auto get_r = ops->get(m->backend->ctx, bpath);
+        if (n00b_result_is_err(get_r)) {
+            if (n00b_result_get_err(get_r) != N00B_VFS_ERR_NOT_FOUND) {
+                return n00b_result_err(bool, n00b_result_get_err(get_r));
+            }
+            put_r = ops->put(m->backend->ctx, bpath, data);
+        }
+        else {
+            n00b_buffer_t *whole = n00b_result_get(get_r);
+            n00b_buffer_concat(whole, data);
+            put_r = ops->put(m->backend->ctx, bpath, whole);
+        }
+    }
+    if (n00b_result_is_err(put_r)) {
+        return put_r;
+    }
+
+    hctx.point = N00B_VFS_HOOK_POST_WRITE;
+    n00b_data_read_lock(m->lock);
+    run_hooks(m, &hctx);
+    n00b_data_unlock(m->lock);
+    return put_r;
+}
+
+n00b_result_t(bool)
 n00b_vfs_delete(n00b_vfs_t *vfs, n00b_string_t *path)
 {
     if (vfs == nullptr || path == nullptr) {

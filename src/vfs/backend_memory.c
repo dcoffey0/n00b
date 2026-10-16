@@ -154,6 +154,26 @@ mem_put_if_absent(void *ctx, n00b_string_t *path, n00b_buffer_t *data)
 }
 
 static n00b_result_t(bool)
+mem_append(void *ctx, n00b_string_t *path, n00b_buffer_t *data)
+{
+    mem_ctx_t     *mc = ctx;
+    bool           found;
+    n00b_buffer_t *cur = n00b_dict_get(&mc->data, path, &found);
+
+    if (!found) {
+        return mem_put(ctx, path, data);
+    }
+
+    // A reader may hold the stored buffer, so the longer one replaces it.
+    n00b_buffer_t *grown = n00b_buffer_copy(cur, .allocator = mc->allocator);
+    n00b_buffer_concat(grown, data);
+    n00b_dict_put(&mc->data, path, grown);
+    make_stat(mc, path, N00B_VFS_OBJ_FILE, n00b_buffer_len(grown));
+
+    return n00b_result_ok(bool, true);
+}
+
+static n00b_result_t(bool)
 mem_del(void *ctx, n00b_string_t *path)
 {
     mem_ctx_t *mc = ctx;
@@ -332,6 +352,7 @@ const n00b_vfs_backend_ops_t n00b_vfs_backend_memory_ops = {
     .get_range           = mem_get_range,
     .put                 = mem_put,
     .put_if_absent       = mem_put_if_absent,
+    .append              = mem_append,
     .del                 = mem_del,
     .stat                = mem_stat,
     .list                = mem_list,

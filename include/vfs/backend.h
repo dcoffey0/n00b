@@ -133,6 +133,16 @@ struct n00b_vfs_backend_ops {
      */
     bool list_result_owns_strings;
 
+    /**
+     * @brief Append bytes to the end of an object, creating it when absent.
+     *
+     * Optional. Without it, n00b_vfs_append rewrites the whole object
+     * through get and put.
+     */
+    n00b_result_t(bool) (*append)(void          *ctx,
+                                   n00b_string_t *path,
+                                   n00b_buffer_t *data);
+
     // ── Optional: hard link (local backend only) ───────────────────
 
     n00b_result_t(bool) (*link)(void *ctx, n00b_string_t *target,

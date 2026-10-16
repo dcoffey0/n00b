@@ -344,6 +344,23 @@ extern n00b_result_t(bool)
 n00b_vfs_sync(n00b_vfs_t *vfs, n00b_string_t *path);
 
 /**
+ * @brief Append bytes to the end of one VFS object, creating it when absent.
+ *
+ * A backend with an append operation writes only @p data. Any other backend
+ * rewrites the whole object, so there the cost is the object's size. The
+ * append is not durable until the caller syncs the path, and its parent
+ * when the append created it.
+ *
+ * @param vfs  VFS instance.
+ * @param path Absolute VFS object path.
+ * @param data Bytes to append.
+ *
+ * @return Ok(true) once the bytes are in the object, or a typed VFS error.
+ */
+extern n00b_result_t(bool)
+n00b_vfs_append(n00b_vfs_t *vfs, n00b_string_t *path, n00b_buffer_t *data);
+
+/**
  * @brief Delete one VFS object.
  *
  * @param vfs  VFS instance.

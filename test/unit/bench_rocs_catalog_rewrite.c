@@ -241,13 +241,15 @@ walk_catalog(n00b_buffer_t *image)
     composition_t c = {};
     c.total         = (uint64_t)n00b_buffer_len(image);
 
-    // Header: 8 magic bytes (per-byte u8 path) then 8 u64s.
+    // Header (v7): 8 magic bytes (per-byte u8 path) then 10 u64s -- version
+    // at byte 8, the append-only log's epoch and id at bytes 64 and 72, and
+    // the entry count at byte 80. Entries start at byte 88.
     c.u8_bytes += 8;
-    CHECK(get_u64(image, 8) == 6);
-    c.u64_bytes += 8 * 8;
-    c.entries = get_u64(image, 64);
+    CHECK(get_u64(image, 8) == 7);
+    c.u64_bytes += 10 * 8;
+    c.entries = get_u64(image, 80);
 
-    int64_t at = 72;
+    int64_t at = 88;
     for (uint64_t e = 0; e < c.entries; e++) {
         at += 7 * 8; // state, shard_id, generation, byte_len, records, schema, seal_ts
         c.u64_bytes += 7 * 8;
